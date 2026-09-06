@@ -1,6 +1,6 @@
 #pragma once
-#include "concurrent/pool.hpp"
-#include "concurrent/task.hpp"
+#include "nexus/pool.hpp"
+#include "nexus/task.hpp"
 #include <algorithm>
 #include <concepts>
 #include <cstddef>
@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace concurrent {
+namespace huxint::nexus {
 
     namespace detail {
 
@@ -142,7 +142,7 @@ namespace concurrent {
         /// 整批性失败(提交期抛出的异常): 容器扩容等分配失败仍经 submit_error
         /// 承载, 其余异常(F 拷贝/元素搬运/用户迭代器)原样透传, 不误标为 OOM.
         /// 迭代时以末尾追加的一个错误元素体现, 故不会被静默吞掉
-        /// @return 空指针 = 无整批失败; 可用 concurrent::submit_error_of 辨识提交类失败
+        /// @return 空指针 = 无整批失败; 可用 huxint::nexus::submit_error_of 辨识提交类失败
         [[nodiscard]]
         std::exception_ptr batch_error() const noexcept {
             return fatal_;
@@ -206,7 +206,7 @@ namespace concurrent {
         }
 
         /// 阻塞取回第 i 个结果. 提交期失败经 exception_ptr 承载 submit_error,
-        /// 可用 concurrent::submit_error_of 还原
+        /// 可用 huxint::nexus::submit_error_of 还原
         [[nodiscard]]
         value_type fetch(std::size_t i) {
             if (i >= slots_.size()) {
@@ -325,4 +325,4 @@ namespace concurrent {
         return parallel_map_chunked(p, std::forward<R>(range), std::move(fn), grain);
     }
 
-} // namespace concurrent
+} // namespace huxint::nexus

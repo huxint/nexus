@@ -2,7 +2,7 @@
 #include <concepts>
 #include <cstddef>
 
-namespace concurrent::detail {
+namespace huxint::nexus::detail {
 
     /**
      * @brief 有界侵入式空闲节点栈
@@ -54,4 +54,4 @@ namespace concurrent::detail {
         std::size_t size_ = 0;
     };
 
-} // namespace concurrent::detail
+} // namespace huxint::nexus::detail

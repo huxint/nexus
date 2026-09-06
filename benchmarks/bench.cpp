@@ -1,4 +1,4 @@
-#include <concurrent/concurrent.hpp>
+#include <nexus/nexus.hpp>
 
 // 第三方基线头未必按本仓库的警告集编写, 仅对引入行关闭诊断
 #pragma GCC diagnostic push
@@ -10,7 +10,7 @@
 #include "third_party/BS_thread_pool.hpp"
 #include "third_party/concurrentqueue.h"
 #include <taskflow/taskflow.hpp>
-#ifdef CONCURRENT_BENCH_TBB
+#ifdef NEXUS_BENCH_TBB
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 #include <tbb/task_arena.h>
@@ -38,7 +38,7 @@
 #include <utility>
 #include <vector>
 
-// 同机对比: concurrent::pool vs Taskflow vs BS::thread_pool,
+// 同机对比: huxint::nexus::pool vs Taskflow vs BS::thread_pool,
 // 扩展基线: oneTBB(系统包)与 moodycamel 队列自建池
 //
 // 公平性约定:
@@ -195,7 +195,7 @@ namespace {
         }
     };
     struct cf_fork {
-        using pool_t = concurrent::pool;
+        using pool_t = huxint::nexus::pool;
         static void go(pool_t& p, std::atomic<std::size_t>& leaves, std::size_t d) noexcept {
             if (d == 0) {
                 leaves.fetch_add(1, std::memory_order_release);
@@ -262,7 +262,7 @@ namespace {
     // 特性组合吞吐: 以 execute 单生产者为统一负载, 度量各标签组合的调度开销
     template <typename Pool>
     double fire_rate_mops(std::size_t threads, std::size_t count,
-                          concurrent::trace_hooks hooks = {}) {
+                          huxint::nexus::trace_hooks hooks = {}) {
         typename Pool::options o{};
         o.threads = threads;
         o.hooks = std::move(hooks);
@@ -295,7 +295,7 @@ int main(int argc, char** argv) {
     const std::size_t reps = quick ? 1 : 3;
     const std::size_t scale = quick ? 10 : 1;
 
-    using concurrent::pool;
+    using huxint::nexus::pool;
 
     // 各池的构造与 fire-and-forget 生产, 多个场景共用
     const auto make_tf = [&] { return tf::Executor(threads); };
@@ -318,7 +318,7 @@ int main(int argc, char** argv) {
         }
     };
 
-    std::println("ThreadPool benchmark: concurrent::pool vs Taskflow vs BS::thread_pool");
+    std::println("ThreadPool benchmark: huxint::nexus::pool vs Taskflow vs BS::thread_pool");
     std::println("hardware concurrency {}, benchmark threads {}, best of {} reps{}", hw, threads, reps,
                  quick ? " (--quick reduced scale)" : "");
 
@@ -369,7 +369,7 @@ int main(int argc, char** argv) {
                 }
             }
             if (sum != static_cast<long>(count)) {
-                std::println("!! concurrent result verification failed");
+                std::println("!! huxint::nexus result verification failed");
                 std::abort();
             }
         }));
@@ -404,7 +404,7 @@ int main(int argc, char** argv) {
 
     // 吞吐: 多生产者竞争提交
 
-    section("throughput: multi-producer concurrent submit (M tasks/s)");
+    section("throughput: multi-producer huxint::nexus submit (M tasks/s)");
     comparison_header();
     for (const std::size_t producers : {std::size_t{2}, std::size_t{4}, std::size_t{8}}) {
         const std::size_t each = 100'000 / scale;
@@ -569,14 +569,14 @@ int main(int argc, char** argv) {
     {
         const std::size_t count = 500'000 / scale;
 
-        using prio_pool = concurrent::basic_pool<decltype(concurrent::priority)>;
-        using cancel_pool = concurrent::basic_pool<decltype(concurrent::cancellable)>;
-        using trace_pool = concurrent::basic_pool<decltype(concurrent::trace)>;
-        using capped_pool = concurrent::basic_pool<decltype(concurrent::worker_cap<8>)>;
+        using prio_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::priority)>;
+        using cancel_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::cancellable)>;
+        using trace_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::trace)>;
+        using capped_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::worker_cap<8>)>;
         using all_pool =
-            concurrent::basic_pool<decltype(concurrent::priority),
-                                   decltype(concurrent::cancellable), decltype(concurrent::trace),
-                                   decltype(concurrent::worker_cap<8>)>;
+            huxint::nexus::basic_pool<decltype(huxint::nexus::priority),
+                                   decltype(huxint::nexus::cancellable), decltype(huxint::nexus::trace),
+                                   decltype(huxint::nexus::worker_cap<8>)>;
 
         // 各组合的测量闭包; 交错采样让它们在相近的系统状态下被测量
         const std::vector<std::pair<std::string_view, std::function<double(std::size_t)>>> combos =
@@ -588,8 +588,8 @@ int main(int argc, char** argv) {
               [&](std::size_t c) { return fire_rate_mops<trace_pool>(threads, c); }},
              {"+ trace on_end empty hook",
               [&](std::size_t c) {
-                  concurrent::trace_hooks h;
-                  h.on_end = [](concurrent::trace_event) noexcept {};
+                  huxint::nexus::trace_hooks h;
+                  h.on_end = [](huxint::nexus::trace_event) noexcept {};
                   return fire_rate_mops<trace_pool>(threads, c, std::move(h));
               }},
              {"+ worker_cap<8>",
@@ -626,7 +626,7 @@ int main(int argc, char** argv) {
     {
         std::vector<std::uint64_t> data(quick ? 64 : 512, LONG_ITERS);
         const double ours = best_pool_seconds(reps, make_ours, [&](auto& p) {
-            auto v = concurrent::parallel_map(
+            auto v = huxint::nexus::parallel_map(
                 p, data, [](std::uint64_t k) { return spin_work(k); });
             require_success(v.run());
         }) * 1e3;
@@ -644,7 +644,7 @@ int main(int argc, char** argv) {
                 p.enqueue([&n] { n.fetch_add(1, std::memory_order_release); });
             }
         };
-#ifdef CONCURRENT_BENCH_TBB
+#ifdef NEXUS_BENCH_TBB
         const auto make_tbb = [&] { return tbb::task_arena(static_cast<int>(threads), 0); };
         const auto produce_tbb = [](auto& arena, auto& n, std::size_t cnt) {
             for (std::size_t i = 0; i < cnt; ++i) {
@@ -670,7 +670,7 @@ int main(int argc, char** argv) {
         {
             const std::size_t count = 500'000 / scale;
             std::optional<double> tbb;
-#ifdef CONCURRENT_BENCH_TBB
+#ifdef NEXUS_BENCH_TBB
             tbb = mops(count, fire_secs(reps, 1, count, make_tbb, produce_tbb));
 #endif
             const double mcq = mops(count, fire_secs(reps, 1, count, make_mcq, produce_mcq));
@@ -684,7 +684,7 @@ int main(int argc, char** argv) {
             const std::size_t each = 100'000 / scale;
             const std::size_t total = producers * each;
             std::optional<double> tbb;
-#ifdef CONCURRENT_BENCH_TBB
+#ifdef NEXUS_BENCH_TBB
             tbb = mops(total, fire_secs(reps, producers, each, make_tbb, produce_tbb));
 #endif
             const double mcq = mops(total, fire_secs(reps, producers, each, make_mcq, produce_mcq));
@@ -698,7 +698,7 @@ int main(int argc, char** argv) {
             const std::size_t depth = fork_depth(quick);
             const std::size_t leaves_expect = std::size_t{1} << depth;
             std::optional<double> tbb;
-#ifdef CONCURRENT_BENCH_TBB
+#ifdef NEXUS_BENCH_TBB
             tbb = mops(leaves_expect, best_pool_seconds(reps, make_tbb, [&](auto& arena) {
                 std::atomic<std::size_t> leaves{0};
                 arena.execute([&] {
@@ -738,7 +738,7 @@ int main(int argc, char** argv) {
             std::println("{:<{}} {:>{}} {:>{}} {:>9}", "case (ms)", NAME_W, "oneTBB", COL_W, "ours",
                          COL_W, "vs TBB");
             std::optional<double> tbb;
-#ifdef CONCURRENT_BENCH_TBB
+#ifdef NEXUS_BENCH_TBB
             tbb = best_pool_seconds(reps, make_tbb, [&](auto& arena) {
                       arena.execute([&] {
                           tbb::parallel_for(tbb::blocked_range<std::size_t>(0, data.size(), 64),
@@ -755,7 +755,7 @@ int main(int argc, char** argv) {
                   1e3;
 #endif
             const double ours = best_pool_seconds(reps, make_ours, [&](auto& p) {
-                                    auto v = concurrent::parallel_map_chunked(
+                                    auto v = huxint::nexus::parallel_map_chunked(
                                         p, data,
                                         [](auto&& chunk) {
                                             double acc = 0;

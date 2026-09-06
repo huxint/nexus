@@ -2,8 +2,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include <concurrent/concurrent.hpp>
-#include <concurrent/execution.hpp>
+#include <nexus/nexus.hpp>
+#include <nexus/execution.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -11,9 +11,9 @@
 #include <string>
 #include <thread>
 
-using namespace concurrent;
+using namespace huxint::nexus;
 
-TEST_SUITE("concurrent.stdexec") {
+TEST_SUITE("huxint::nexus.stdexec") {
 
     // scheduler 概念成立(结构化概念, 无需 tag)
     static_assert(stdexec::scheduler<ex::pool_scheduler<pool>>);

@@ -1,6 +1,6 @@
-// 模块冒烟测试: 证明 `import concurrent.pool;` 真能替代头文件引入
+// 模块冒烟测试: 证明 `import huxint.nexus;` 真能替代头文件引入
 //
-// 模式示例: 标准库头在前, import 在后(见 concurrent.cppm 顶部"混用须知"); 下列为本文件所需
+// 模式示例: 标准库头在前, import 在后(见 huxint::nexus.cppm 顶部"混用须知"); 下列为本文件所需
 #include <atomic>
 #include <chrono>
 #include <concepts>
@@ -20,10 +20,10 @@
 #include <variant>
 #include <vector>
 
-import concurrent.pool;
+import huxint.nexus;
 
 int main() {
-    concurrent::basic_pool<decltype(concurrent::priority)> p({.threads = 2});
+    huxint::nexus::basic_pool<decltype(huxint::nexus::priority)> p({.threads = 2});
 
     // submit + 结果通道
     auto t = p.submit([](int x) { return x * 2; }, 21);
@@ -43,13 +43,13 @@ int main() {
     if (!a || !b) {
         return 1;
     }
-    auto sum = concurrent::when_all(std::move(*a), std::move(*b)).map([](auto&& tup) {
+    auto sum = huxint::nexus::when_all(std::move(*a), std::move(*b)).map([](auto&& tup) {
         return std::get<0>(tup) + std::get<1>(tup);
     });
 
     // 惰性批量: 原生数组区间, begin/end 迭代按序取回
     int data[4] = {1, 2, 3, 4};
-    auto view = concurrent::parallel_map(p, data, [](int x) noexcept { return x * 10; });
+    auto view = huxint::nexus::parallel_map(p, data, [](int x) noexcept { return x * 10; });
     int total = 0;
     for (auto it = view.begin(); it != view.end(); ++it) {
         if (!*it) {
@@ -61,10 +61,10 @@ int main() {
     // 分块入口与视图类型经模块可达: parallel_view 模板名可命名(任意合法实例化),
     // chunked 求和按块取回
     int data2[6] = {1, 2, 3, 4, 5, 6};
-    auto cv = concurrent::parallel_map_chunked(
+    auto cv = huxint::nexus::parallel_map_chunked(
         p, data2, [](auto&& c) { return std::accumulate(c.begin(), c.end(), 0); }, 3);
     using pv_proof =
-        concurrent::parallel_view<decltype(p), decltype(std::views::all(data2)), int (*)(int)>;
+        huxint::nexus::parallel_view<decltype(p), decltype(std::views::all(data2)), int (*)(int)>;
     static_assert(
         std::same_as<typename pv_proof::value_type, std::expected<int, std::exception_ptr>>);
     int ctotal = 0;

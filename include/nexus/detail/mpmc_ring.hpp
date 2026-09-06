@@ -7,7 +7,7 @@
 #include <span>
 #include <type_traits>
 
-namespace concurrent::detail {
+namespace huxint::nexus::detail {
 
     /// Vyukov 有界 MPMC 环形队列. 槽类型为指针
     /// 快路径纯无锁; 满/空语义由调用方处理(try_push 返回 false, try_pop 返回 nullptr)
@@ -134,4 +134,4 @@ namespace concurrent::detail {
         std::array<cell, Capacity> cells_;
     };
 
-} // namespace concurrent::detail
+} // namespace huxint::nexus::detail

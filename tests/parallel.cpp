@@ -1,5 +1,5 @@
 #include "utils.hpp"
-#include <concurrent/concurrent.hpp>
+#include <nexus/nexus.hpp>
 #include <doctest/doctest.h>
 
 #include <atomic>
@@ -12,10 +12,10 @@
 #include <thread>
 #include <vector>
 
-using namespace concurrent;
+using namespace huxint::nexus;
 using namespace std::chrono_literals;
 
-TEST_SUITE("concurrent.parallel") {
+TEST_SUITE("huxint::nexus.parallel") {
 
     // 惰性语义
 

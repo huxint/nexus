@@ -5,7 +5,7 @@
 #include <thread> // 仅兜底分支需要
 #endif
 
-namespace concurrent::detail {
+namespace huxint::nexus::detail {
 
     /// 自旋等待中的一次"让核"提示: 在超线程上把流水线资源让给兄弟逻辑核,
     /// 并降低退出自旋时的内存序错误推测惩罚. 非阻塞, 不进内核
@@ -21,4 +21,4 @@ namespace concurrent::detail {
 #endif
     }
 
-} // namespace concurrent::detail
+} // namespace huxint::nexus::detail

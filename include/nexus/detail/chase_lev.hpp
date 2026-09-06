@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <type_traits>
 
-namespace concurrent::detail {
+namespace huxint::nexus::detail {
 
     /// 固定容量 Chase-Lev 工作窃取双端队列(环形缓冲 + 单调递增索引)
     /// 槽类型为指针(池内为 task_node*)
@@ -106,4 +106,4 @@ namespace concurrent::detail {
         std::array<std::atomic<T>, Capacity> slots_{};
     };
 
-} // namespace concurrent::detail
+} // namespace huxint::nexus::detail

@@ -1,5 +1,5 @@
 #include "utils.hpp"
-#include <concurrent/concurrent.hpp>
+#include <nexus/nexus.hpp>
 #include <doctest/doctest.h>
 
 #include <atomic>
@@ -11,10 +11,10 @@
 #include <tuple>
 #include <vector>
 
-using namespace concurrent;
+using namespace huxint::nexus;
 using namespace std::chrono_literals;
 
-TEST_SUITE("concurrent.task") {
+TEST_SUITE("huxint::nexus.task") {
 
     // map
 

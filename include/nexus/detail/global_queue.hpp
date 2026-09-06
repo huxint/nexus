@@ -1,13 +1,13 @@
 #pragma once
-#include "concurrent/detail/mpmc_ring.hpp"
-#include "concurrent/detail/spinlock.hpp"
+#include "nexus/detail/mpmc_ring.hpp"
+#include "nexus/detail/spinlock.hpp"
 #include <atomic>
 #include <concepts>
 #include <cstddef>
 #include <mutex>
 #include <span>
 
-namespace concurrent::detail {
+namespace huxint::nexus::detail {
 
     /**
      * @brief 可增长的全局任务队列: Vyukov 有界环(快路径)+ 侵入式溢出链(慢路径)
@@ -162,4 +162,4 @@ namespace concurrent::detail {
         Node* tail_ = nullptr;
     };
 
-} // namespace concurrent::detail
+} // namespace huxint::nexus::detail

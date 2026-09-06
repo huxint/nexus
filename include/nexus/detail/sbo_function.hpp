@@ -6,7 +6,7 @@
 #include <type_traits>
 #include <utility>
 
-namespace concurrent::detail {
+namespace huxint::nexus::detail {
 
     /// 小缓冲优化的移动专用函数. 可调用体不超过 SboBytes 时零堆分配
     /// 调用签名固定为 R(). 构造时的堆分配仅发生在提交边界, 由调用方 catch
@@ -132,4 +132,4 @@ namespace concurrent::detail {
         const vtable* vt_ = nullptr;
     };
 
-} // namespace concurrent::detail
+} // namespace huxint::nexus::detail

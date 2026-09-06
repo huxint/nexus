@@ -1,12 +1,12 @@
 #include <atomic>
 #include <chrono>
-#include <concurrent/concurrent.hpp>
+#include <nexus/nexus.hpp>
 #include <print>
 #include <string>
 #include <thread>
 #include <vector>
 
-using namespace concurrent;
+using namespace huxint::nexus;
 
 int main() {
     // 基础用法: submit 返回 expected<task<T>, submit_error>

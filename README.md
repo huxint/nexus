@@ -1,4 +1,4 @@
-# ThreadPool
+# nexus
 
 ![C++](https://img.shields.io/badge/C%2B%2B-26-00599C?logo=cplusplus&logoColor=white)
 ![GCC](https://img.shields.io/badge/GCC-16.2%2B-blue)
@@ -34,17 +34,17 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
 ctest --test-dir build          # 测试
-./build/concurrent_example      # 示例
-./build/concurrent_bench        # 基准(--quick 缩减规模)
+./build/nexus_example      # 示例
+./build/nexus_bench        # 基准(--quick 缩减规模)
 ```
 
-库本身零依赖 header-only: 消费方 `add_subdirectory` 后 `target_link_libraries(app PRIVATE concurrent)` 即可, 或直接把 `include/` 加入头文件搜索路径并链接 Threads, 且 GCC 下须以 `-fcontracts` 编译链接(公共头含契约语法, 缺该 flag 时链接期缺 `handle_contract_violation`)
+库本身零依赖 header-only: 消费方 `add_subdirectory` 后 `target_link_libraries(app PRIVATE huxint::nexus)` 即可, 或直接把 `include/` 加入头文件搜索路径并链接 Threads, 且 GCC 下须以 `-fcontracts` 编译链接(公共头含契约语法, 缺该 flag 时链接期缺 `handle_contract_violation`)
 
 ```cpp
-#include <concurrent/pool.hpp>
+#include <nexus/pool.hpp>
 #include <print>
 
-using namespace concurrent;
+using namespace huxint::nexus;
 
 pool p({.threads = 4});
 
@@ -135,10 +135,10 @@ task 组合子(均在完成任务的工作线程上内联执行; 结果值恰好
 核心库零依赖; 需要 sender/receiver 生态(`then` / `when_all` / `split` / 标准算法)时:
 
 ```cpp
-#include <concurrent/execution.hpp>   // 提供 stdexec 的 TU 须先自行引入该库
+#include <nexus/execution.hpp>   // 提供 stdexec 的 TU 须先自行引入该库
 
-concurrent::pool p({.threads = 4});
-auto sched = concurrent::ex::as_scheduler(p);
+huxint::nexus::pool p({.threads = 4});
+auto sched = huxint::nexus::ex::as_scheduler(p);
 
 using namespace stdexec;
 auto [v] = sync_wait(sched.schedule() | then([] { return 42; })).value();
@@ -151,8 +151,8 @@ auto [v] = sync_wait(sched.schedule() | then([] { return 42; })).value();
 基准对比 [Taskflow](https://github.com/taskflow/taskflow)、[BS::thread_pool](https://github.com/bshoshany/thread-pool)、可选的 [oneTBB](https://github.com/oneapi-src/oneTBB), 以及基于 [moodycamel](https://github.com/cameron314/concurrentqueue) 队列的对比池:
 
 ```bash
-./build/concurrent_bench --quick
-./build/concurrent_bench
+./build/nexus_bench --quick
+./build/nexus_bench
 ```
 
 程序输出单生产者与多生产者吞吐、提交并取回结果的往返延迟、递归 fork-join、混合负载、线程数扩展性和分块并行映射. 完整运行的吞吐与耗时项目预热后测量 3 次并取最短耗时, 延迟统计 30,000 次连续往返的分位数; `--quick` 缩减任务数与延迟样本, 吞吐与耗时仅测量一次. 池的创建和销毁在计时之外, 吞吐测试复用已创建的生产者线程.
@@ -173,13 +173,13 @@ auto [v] = sync_wait(sched.schedule() | then([] { return 42; })).value();
 
 | 选项 | 说明 |
 |------|------|
-| `-DBUILD_MODULE=ON` | 模块封装 `concurrent.pool`(需 Ninja) |
+| `-DBUILD_MODULE=ON` | 模块封装 `huxint.nexus`(需 Ninja) |
 | `-DSANITIZER=address\|thread` | 叠加 UBSan 的消毒器构建 |
 | `-DWITH_STDEXEC=ON -DSTDEXEC_ROOT=<path>` | P2300 scheduler 集成测试(独立目标; path 为含 `stdexec/` 的包含根) |
 
 契约(Contracts)在 Debug 下 enforce, 其余配置 ignore(零开销). 配置即生成 `compile_commands.json` 并软链到仓库根目录
 
-模块封装: `-DBUILD_MODULE=ON` 构建后即可 `import concurrent.pool;`. 注意标准库文本包含须置于 `import` 之前(GCC 16 工具链限制), 完整示例见 `module/smoke.cpp`
+模块封装: `-DBUILD_MODULE=ON` 构建后即可 `import huxint.nexus;`. 注意标准库文本包含须置于 `import` 之前(GCC 16 工具链限制), 完整示例见 `module/smoke.cpp`
 
 测试基于 [doctest](https://github.com/doctest/doctest)(单头, 零依赖), 覆盖提交语义, 优先级, 取消, 异常通道, 生命周期, 组合子, 惰性批量与无锁容器并发回归:
 

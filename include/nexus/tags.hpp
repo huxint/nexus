@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <type_traits>
 
-namespace concurrent {
+namespace huxint::nexus {
 
     /// 任务优先级档位(priority 标签下生效, best-effort 语义)
     /// 枚举值即层级序: 层索引 = 层数-1-档位(高优先级层号小)
@@ -130,4 +130,4 @@ namespace concurrent {
         inline constexpr std::size_t worker_capacity_v =
             (std::max({worker_cap_value<Flags>::value..., 0uz}));
     } // namespace detail
-} // namespace concurrent
+} // namespace huxint::nexus

@@ -1,5 +1,5 @@
 #include "utils.hpp"
-#include <concurrent/concurrent.hpp>
+#include <nexus/nexus.hpp>
 #include <doctest/doctest.h>
 
 #include <algorithm>
@@ -22,10 +22,10 @@
 #include <unistd.h>
 #endif
 
-using namespace concurrent;
+using namespace huxint::nexus;
 using namespace std::chrono_literals;
 
-TEST_SUITE("concurrent.pool") {
+TEST_SUITE("huxint.nexus") {
 
     // 提交语义
 

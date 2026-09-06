@@ -1,14 +1,14 @@
 #pragma once
-#include "concurrent/detail/chase_lev.hpp"
-#include "concurrent/detail/contract_assert.hpp"
-#include "concurrent/detail/cpu_relax.hpp"
-#include "concurrent/detail/global_queue.hpp"
-#include "concurrent/detail/mpmc_ring.hpp"
-#include "concurrent/detail/node_cache.hpp"
-#include "concurrent/detail/spinlock.hpp"
-#include "concurrent/tags.hpp"
-#include "concurrent/task.hpp"
-#include "concurrent/trace.hpp"
+#include "nexus/detail/chase_lev.hpp"
+#include "nexus/detail/contract_assert.hpp"
+#include "nexus/detail/cpu_relax.hpp"
+#include "nexus/detail/global_queue.hpp"
+#include "nexus/detail/mpmc_ring.hpp"
+#include "nexus/detail/node_cache.hpp"
+#include "nexus/detail/spinlock.hpp"
+#include "nexus/tags.hpp"
+#include "nexus/task.hpp"
+#include "nexus/trace.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -30,7 +30,7 @@
 #include <variant>
 #include <vector>
 
-namespace concurrent {
+namespace huxint::nexus {
 
     /// 关闭策略
     enum class shutdown_policy : std::uint8_t {
@@ -1346,4 +1346,4 @@ namespace concurrent {
     /// 默认别名: 无特性的基础形态
     using pool = basic_pool<>;
 
-} // namespace concurrent
+} // namespace huxint::nexus

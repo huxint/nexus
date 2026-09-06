@@ -1,8 +1,8 @@
-#include <concurrent/detail/chase_lev.hpp>
-#include <concurrent/detail/global_queue.hpp>
-#include <concurrent/detail/mpmc_ring.hpp>
-#include <concurrent/detail/node_cache.hpp>
-#include <concurrent/detail/sbo_function.hpp>
+#include <nexus/detail/chase_lev.hpp>
+#include <nexus/detail/global_queue.hpp>
+#include <nexus/detail/mpmc_ring.hpp>
+#include <nexus/detail/node_cache.hpp>
+#include <nexus/detail/sbo_function.hpp>
 #include <doctest/doctest.h>
 
 #include <array>
@@ -10,7 +10,7 @@
 #include <thread>
 #include <vector>
 
-using namespace concurrent::detail;
+using namespace huxint::nexus::detail;
 
 // 概念探测: 约束不满足 => 替换失败 => false. 用于容量约束的否定测试
 template <typename T, std::size_t C>
@@ -18,7 +18,7 @@ concept ring_ok = requires { typename mpmc_ring<T, C>; };
 template <typename T, std::size_t C>
 concept deque_ok = requires { typename chase_lev_deque<T, C>; };
 
-TEST_SUITE("concurrent.detail") {
+TEST_SUITE("huxint::nexus.detail") {
 
     // 回归: 手写 (C & (C-1)) == 0 在 C == 0 时为真 -> 零容量会被放行,
     // mask = -1 + 零长数组即 UB. has_single_bit 天然拒绝 0 与非两的幂

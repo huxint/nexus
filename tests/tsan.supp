@@ -5,6 +5,6 @@
 # 双方运行库均未按 TSan 语义编译, TSan 将其拦截为 data race.
 # 报告栈顶为 libubsan 的 pipe 写入帧, 不含任何项目帧.
 #
-# 库自身代码零抑制 - 任何指向 include/concurrent 或 tests 的报告都应视为真实缺陷.
+# 库自身代码零抑制 - 任何指向 include/huxint::nexus 或 tests 的报告都应视为真实缺陷.
 
 race:libubsan

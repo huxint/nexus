@@ -1,9 +1,9 @@
 #pragma once
-#include "concurrent/tags.hpp"
+#include "nexus/tags.hpp"
 #include <cstdint>
 #include <functional>
 
-namespace concurrent {
+namespace huxint::nexus {
 
     /// trace_event 的阶段
     enum class task_phase : std::uint8_t {
@@ -40,4 +40,4 @@ namespace concurrent {
         std::move_only_function<void(trace_event) noexcept> on_end;
     };
 
-} // namespace concurrent
+} // namespace huxint::nexus

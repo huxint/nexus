@@ -1,5 +1,5 @@
 #pragma once
-#include "concurrent/detail/sbo_function.hpp"
+#include "nexus/detail/sbo_function.hpp"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace concurrent {
+namespace huxint::nexus {
 
     /// 提交失败的错误类别
     enum class submit_error : std::uint8_t {
@@ -774,4 +774,4 @@ namespace concurrent {
         }
     }
 
-} // namespace concurrent
+} // namespace huxint::nexus

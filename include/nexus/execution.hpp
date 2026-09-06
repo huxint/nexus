@@ -1,19 +1,19 @@
 #pragma once
 // P2300 (stdexec) 暴露面: 池作为 scheduler. 可选依赖 - 本头不进
-// concurrent.hpp 的无条件包含链, 核心库保持零依赖 header-only;
+// nexus.hpp 的无条件包含链, 核心库保持零依赖 header-only;
 // 消费方须自行提供 stdexec (2024.12.08 验证) 并显式包含本头
 //
 // 与零 throw 组合子(task::map / when_all)的取舍: stdexec 面获得标准
 // sender/receiver 算法组合(then / when_all / split / bulk ...), 代价是
 // 依赖与 sync_wait 的重抛语义(本库组合子经 expected 报错, 不抛)
-#include "concurrent/pool.hpp"
+#include "nexus/pool.hpp"
 #include <stdexec/execution.hpp>
 #include <exception>
 #include <memory>
 #include <type_traits>
 #include <utility>
 
-namespace concurrent::ex {
+namespace huxint::nexus::ex {
 
     template <typename Pool>
     class pool_scheduler;
@@ -111,4 +111,4 @@ namespace concurrent::ex {
         return pool_scheduler<Pool>{p};
     }
 
-} // namespace concurrent::ex
+} // namespace huxint::nexus::ex

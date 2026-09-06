@@ -1,8 +1,8 @@
 #pragma once
-#include "concurrent/detail/cpu_relax.hpp"
+#include "nexus/detail/cpu_relax.hpp"
 #include <atomic>
 
-namespace concurrent::detail {
+namespace huxint::nexus::detail {
 
     /// 极短临界区专用自旋锁(溢出链表接驳)
     /// 争用时以 cpu_relax 让核, 避免在超线程上把兄弟逻辑核的流水线一起拖住
@@ -29,4 +29,4 @@ namespace concurrent::detail {
         std::atomic_flag flag_{};
     };
 
-} // namespace concurrent::detail
+} // namespace huxint::nexus::detail
