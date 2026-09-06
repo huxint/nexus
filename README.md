@@ -7,11 +7,11 @@
 ![tests](https://img.shields.io/badge/tests-doctest-green)
 ![license](https://img.shields.io/badge/license-MIT-success)
 
-C++26 高性能线程池: 工作窃取调度 + 无锁队列 + 函数式任务组合, 全库 API 零异常
+C++26 高性能任务调度器: 工作窃取调度 + 无锁队列 + 函数式任务组合, 全库 API 零异常
 
 ## 为什么选它
 
-零依赖的 header-only 线程池, 面向两类场景: 追求低延迟与高吞吐的任务流(唤醒路径有界自旋, 空池往返亚微秒级), 以及需要错误安全的服务型代码(库自身失败走 `std::expected`, 任务体异常透传至结果通道, 不泄漏到池外). 任务以 128B 节点 + SBO 闭包承载, 外部提交进无锁全局队列, worker 内嵌套提交进本地 deque, 队列满时使用溢出链, 提交不等待空槽.
+零依赖的 header-only 任务调度器, 面向两类场景: 追求低延迟与高吞吐的任务流(唤醒路径有界自旋, 空池往返亚微秒级), 以及需要错误安全的服务型代码(库自身失败走 `std::expected`, 任务体异常透传至结果通道, 不泄漏到池外). 任务以 128B 节点 + SBO 闭包承载, 外部提交进无锁全局队列, worker 内嵌套提交进本地 deque, 队列满时使用溢出链, 提交不等待空槽.
 
 | 特性 | 说明 |
 |------|------|
@@ -33,9 +33,9 @@ C++26 高性能线程池: 工作窃取调度 + 无锁队列 + 函数式任务组
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
-ctest --test-dir build          # 测试
-./build/nexus_example      # 示例
-./build/nexus_bench        # 基准(--quick 缩减规模)
+ctest --test-dir build             # 测试
+./build/nexus_example              # 示例
+./build/nexus_bench                # 基准(--quick 缩减规模)
 ```
 
 库本身零依赖 header-only: 消费方 `add_subdirectory` 后 `target_link_libraries(app PRIVATE huxint::nexus)` 即可, 或直接把 `include/` 加入头文件搜索路径并链接 Threads, 且 GCC 下须以 `-fcontracts` 编译链接(公共头含契约语法, 缺该 flag 时链接期缺 `handle_contract_violation`)
@@ -156,6 +156,38 @@ auto [v] = sync_wait(sched.schedule() | then([] { return 42; })).value();
 ```
 
 程序输出单生产者与多生产者吞吐、提交并取回结果的往返延迟、递归 fork-join、混合负载、线程数扩展性和分块并行映射. 完整运行的吞吐与耗时项目预热后测量 3 次并取最短耗时, 延迟统计 30,000 次连续往返的分位数; `--quick` 缩减任务数与延迟样本, 吞吐与耗时仅测量一次. 池的创建和销毁在计时之外, 吞吐测试复用已创建的生产者线程.
+
+### 参考结果
+
+以下为同一环境 4 次完整运行取中位数(i7-12650H, 16 线程, GCC 16.2, Release; 不同机器与负载下请自行复测):
+
+吞吐(M tasks/s, 越高越好, `vs best` 为相对最强对手):
+
+| 场景 | Taskflow | BS::thread_pool | nexus | vs best |
+|------|---------:|----------------:|------:|--------:|
+| 单生产者即发即忘 | 1.30 | 0.37 | **7.72** | 5.9x |
+| 逐个提交并取回结果 | 0.35 | 0.23 | **1.90** | 8.3x |
+| 递归 fork-join(M leaves/s) | 8.66 | 1.24 | **23.06** | 2.7x |
+| 多生产者 ×8 | 2.41 | 1.32 | **7.12** | 3.0x |
+
+空池往返延迟 `submit` -> `get`(µs, 越低越好):
+
+| 分位 | Taskflow | BS::thread_pool | nexus |
+|------|---------:|----------------:|------:|
+| P50 | 2.75 | 4.59 | **0.51** |
+| P99 | 6.63 | 8.22 | **1.10** |
+| max | 131.5 | 124.0 | **17.3** |
+
+扩展基线(oneTBB / 基于 moodycamel 队列的对比池, M tasks/s):
+
+| 场景 | oneTBB | mcq pool | nexus | vs best |
+|------|-------:|---------:|------:|--------:|
+| 单生产者 | 3.51 | 2.73 | **6.68** | 2.5x |
+| 多生产者 ×8 | 6.66 | 6.55 | **7.05** | 1.1x |
+| 递归 fork-join(M leaves/s) | **25.47** | 5.47 | 23.67 | 0.93x |
+| 分块并行映射 ×64 chunks(ms) | 3.33 | - | **3.17** | 1.05x |
+
+解读: 短任务提交路径与往返延迟是本库的优势面(无锁快路径 + 有界自旋); 纯递归分治上 oneTBB 的 work-stealing arena 仍略快, 对此场景可用 `fork_join` / `parallel_map_chunked` 贴近. 特性标签的开销单独测量(`execute` 单生产者, 相对无标签基线): `priority` / `cancellable` / `worker_cap` 约 1.1-1.3x(多数不亏), `trace` 稳定为约 0.7x(任务 ID 记账 + 钩子检查的固定开销, 追加空 `on_end` 钩子不再明显下降), 全标签组合约 0.7x.
 
 比较时需结合负载理解结果:
 
