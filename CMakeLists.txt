@@ -22,6 +22,7 @@ endif()
 # handle_contract_violation, 故经 INTERFACE 注入该 flag(仅 GCC, Clang 无此选项);
 # 契约求值语义不下发, 由下游自选
 add_library(nexus INTERFACE)
+add_library(huxint::nexus ALIAS nexus)
 target_include_directories(nexus INTERFACE include)
 target_compile_features(nexus INTERFACE cxx_std_26)
 target_link_libraries(nexus INTERFACE Threads::Threads)
