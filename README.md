@@ -5,6 +5,7 @@
 ![CMake](https://img.shields.io/badge/CMake-3.28%2B-064F8C?logo=cmake&logoColor=white)
 ![header-only](https://img.shields.io/badge/layout-header--only-purple)
 ![license](https://img.shields.io/badge/license-MIT-success)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/huxint/nexus?utm_source=badge)
 
 C++26 高性能任务调度器: 工作窃取调度 + 无锁队列 + 函数式任务组合, 全库 API 零异常. 适合低延迟提交、高吞吐短任务流与错误安全并发的场景
 
@@ -64,6 +65,17 @@ p.wait();
 | 空池往返 P50 / P99(µs) | 2.75 / 6.63 | 4.59 / 8.22 | - | - | **0.51** / **1.10** |
 
 短任务提交与往返延迟是优势面; 纯递归分治 oneTBB 略快. 基准含共享原子计数器的竞争成本, 池创建销毁在计时之外
+
+### 持续性能回归
+
+`benchmarks/codspeed_bench.cpp` 是面向 CI 的回归基准(google_benchmark 兼容层), 只测本库自身的提交、派生、批量并行与组合子路径, 每次 push / PR 由 [CodSpeed](https://app.codspeed.io/huxint/nexus) 在 CPU 模拟下计量:
+
+```bash
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DBUILD_CODSPEED_BENCH=ON -DCODSPEED_MODE=simulation
+cmake --build build --target nexus_codspeed_bench
+./build/nexus_codspeed_bench             # 本地直接跑; CI 中由 codspeed 计量
+```
 
 ## 用法
 

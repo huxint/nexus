@@ -97,6 +97,35 @@ if(WITH_STDEXEC)
     add_test(NAME nexus_stdexec_tests COMMAND nexus_stdexec_tests)
 endif()
 
+# -DBUILD_CODSPEED_BENCH=ON: CodSpeed 回归基准(google_benchmark 兼容层, 网络拉取)
+# 计量模式由 -DCODSPEED_MODE=simulation|walltime|memory 选择, 缺省 off 时退化为
+# 普通 google_benchmark 可执行文件
+option(BUILD_CODSPEED_BENCH "build the CodSpeed (google_benchmark) benchmarks" OFF)
+if(BUILD_CODSPEED_BENCH)
+    include(FetchContent)
+    # instrument-hooks 的 dist/core.c 是 zig 转译产物, 其 [[noreturn]] 位置在
+    # C23 下非法 -> 该依赖统一按 C17 编译(GCC 15+ 默认 C23)
+    enable_language(C)
+    set(CMAKE_C_STANDARD 17)
+    set(CMAKE_C_STANDARD_REQUIRED ON)
+    set(BENCHMARK_ENABLE_TESTING OFF)
+    set(BENCHMARK_ENABLE_INSTALL OFF)
+    set(BENCHMARK_ENABLE_GTEST_TESTS OFF)
+    FetchContent_Declare(
+        google_benchmark
+        GIT_REPOSITORY https://github.com/CodSpeedHQ/codspeed-cpp
+        GIT_TAG v2.4.0
+        SOURCE_SUBDIR google_benchmark)
+    FetchContent_MakeAvailable(google_benchmark)
+    if(TARGET instrument_hooks)
+        set_target_properties(instrument_hooks PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON)
+    endif()
+
+    add_executable(nexus_codspeed_bench benchmarks/codspeed_bench.cpp)
+    target_link_libraries(nexus_codspeed_bench PRIVATE nexus benchmark::benchmark)
+    nexus_own_compile_options(nexus_codspeed_bench)
+endif()
+
 if(SANITIZER STREQUAL "thread")
     set_tests_properties(nexus_tests PROPERTIES
         ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
