@@ -68,7 +68,7 @@ p.wait();
 
 ### 持续性能回归
 
-`benchmarks/codspeed_bench.cpp` 是面向 CI 的回归基准(google_benchmark 兼容层), 只测本库自身的提交、派生、批量并行与组合子路径, 每次 push / PR 由 [CodSpeed](https://app.codspeed.io/huxint/nexus) 在 CPU 模拟下计量:
+`benchmarks/codspeed_bench.cpp` 是面向 CI 的回归基准(google_benchmark 兼容层): 既覆盖本库自身的提交、派生、批量并行与组合子路径, 也含 `BM_<lib>_execute` / `BM_<lib>_fork_join` 两组与 Taskflow / BS::thread_pool / oneTBB 的同等负载对照(同线程数、同任务体、各库惯用 API 且阻塞式等待收敛)。每次 push / PR 由 [CodSpeed](https://app.codspeed.io/huxint/nexus) 在 CPU 模拟下计量——**指令数, 硬件无关**; 模拟器会串行化线程, 故反映的是每任务调度开销, 不含并行加速比:
 
 ```bash
 cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \

@@ -29,7 +29,7 @@ jobs:
           curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest \
             | tar -xj -C "$HOME" bin/micromamba
           "$HOME/bin/micromamba" create -y -p "$HOME/gcc16" -c conda-forge \
-            gxx_linux-64=16.2.0 cmake ninja
+            gxx_linux-64=16.2.0 cmake ninja tbb-devel
           echo "$HOME/gcc16/bin" >> "$GITHUB_PATH"
 
       - name: Build the benchmarks

@@ -123,6 +123,13 @@ if(BUILD_CODSPEED_BENCH)
 
     add_executable(nexus_codspeed_bench benchmarks/codspeed_bench.cpp)
     target_link_libraries(nexus_codspeed_bench PRIVATE nexus benchmark::benchmark)
+    # 第三方对照基线: 与 nexus_bench 共用同一套头与可选 TBB
+    target_include_directories(nexus_codspeed_bench
+                               PRIVATE benchmarks benchmarks/third_party/taskflow_repo)
+    if(TBB_FOUND)
+        target_link_libraries(nexus_codspeed_bench PRIVATE TBB::tbb)
+        target_compile_definitions(nexus_codspeed_bench PRIVATE NEXUS_BENCH_TBB=1)
+    endif()
     nexus_own_compile_options(nexus_codspeed_bench)
 endif()
 
