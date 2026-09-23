@@ -6,7 +6,7 @@
 // 不把可用性前提强加给下游(与 CMake 侧的 GNU 门控配套)
 
 #if defined(__cpp_contracts)
-#define CONCURRENT_CONTRACT_ASSERT(cond) contract_assert(cond)
+#define NEXUS_CONTRACT_ASSERT(cond) contract_assert(cond)
 #else
-#define CONCURRENT_CONTRACT_ASSERT(cond) static_cast<void>(0)
+#define NEXUS_CONTRACT_ASSERT(cond) static_cast<void>(0)
 #endif

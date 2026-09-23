@@ -1,4 +1,5 @@
 #pragma once
+#include "nexus/detail/contract_assert.hpp"
 #include "nexus/detail/sbo_function.hpp"
 #include <atomic>
 #include <cstddef>
@@ -31,10 +32,22 @@ namespace huxint::nexus {
     /// submit_error_of 判别为"非取消, 非提交失败"
     struct invalid_task {};
 
+    namespace detail {
+        /// 无载荷错误标记的共享错误指针: 关闭丢弃可能一次终结成千上万个
+        /// 排队任务, 逐个 make_exception_ptr 即逐个堆分配. 标记是空类型,
+        /// 多线程并发重抛同一对象无可变状态可竞争
+        template <typename E>
+        [[nodiscard]]
+        const std::exception_ptr& shared_error() noexcept {
+            static const std::exception_ptr e = std::make_exception_ptr(E{});
+            return e;
+        }
+    } // namespace detail
+
     /// 错误通道中 invalid_task 的错误指针
     [[nodiscard]]
     inline std::exception_ptr invalid_task_error() noexcept {
-        return std::make_exception_ptr(invalid_task{});
+        return detail::shared_error<invalid_task>();
     }
 
     namespace detail {
@@ -83,13 +96,12 @@ namespace huxint::nexus {
         /// 任务节点: 窃取队列与全局队列上流转的实体. 稳态由每 worker 空闲链表回收;
         /// 队列槽中仅存指针(平凡可拷贝), 保证 Chase-Lev 读-CAS 语义安全
         struct task_node {
-            /// 88 使节点恰好 128B 填满 malloc 的 128B 桶: 零内存代价下的最大 SBO 容量
-            sbo_function<88> body;
-            /// 排队中被关闭丢弃时的状态收尾(仅 submit 路径设置). 必须先于
-            /// body 析构调用: 闭包持有共享状态引用, 若随节点直接湮灭,
-            /// 用户侧 get() 将在 done 等待上永久阻塞
-            void (*discard)(void* state) noexcept = nullptr;
-            void* discard_ctx = nullptr;
+            /// 任务闭包. 实参 run: true = 执行; false = 从未执行即被丢弃(关闭
+            /// discard / 提交被拒), 持有结果通道的闭包据此以取消语义终结之 -
+            /// 若随节点直接湮灭, 用户侧 get() 将在 done 等待上永久阻塞.
+            /// 丢弃收尾由闭包自身承载, 节点不另存钩子, 执行后也无陈旧状态可残留.
+            /// 104 使节点恰好 128B 填满 malloc 的 128B 桶: 零内存代价下的最大 SBO 容量
+            sbo_function<104, void(bool)> body;
             /// 侵入式链接: 归属全局队列溢出链或 worker 空闲链时的后继. 节点
             /// 同一时刻只在一处, 两种归属共用一个字段
             task_node* next = nullptr;
@@ -286,9 +298,9 @@ namespace huxint::nexus {
                 // 又拒绝后来的 attach, 无需互斥. acq_rel 使 attach 侧看到
                 // 封口时, 本状态的结果/异常/取消字段已然可见
                 cont_node* list = conts_.exchange(closed(), std::memory_order_acq_rel);
-                if (list == closed()) [[unlikely]] {
-                    return; // 已经完成过: 封口值不是链表, 不可遍历
-                }
+                // 每个状态恰有一个完成方(任务体 / 丢弃收尾 / 独占 dst 的续延),
+                // 封口值不是链表, 二次 finish 会把它当链遍历
+                NEXUS_CONTRACT_ASSERT(list != closed());
                 done_.store(1, std::memory_order_release);
                 // 等待者自计数: 无人等待时连库内的等待者查表都免掉
                 // (Dekker 配对: 等待方先登记再复查 done_, 见 wait_done)
@@ -328,9 +340,7 @@ namespace huxint::nexus {
 
             /// 取消即以 operation_cancelled 占据错误通道: get 与续延都只看
             /// 该通道, 无须另设标志
-            void set_cancelled() noexcept {
-                exc_ = std::make_exception_ptr(operation_cancelled{});
-            }
+            void set_cancelled() noexcept { exc_ = shared_error<operation_cancelled>(); }
 
             template <typename... A>
             void emplace_value(A&&... a) noexcept(std::is_nothrow_constructible_v<T, A...>) {
@@ -444,6 +454,20 @@ namespace huxint::nexus {
             }
         }
 
+        /// task 内部状态的库内访问口: 组合子经此接线, st_ 对库外保持私有
+        struct task_access {
+            template <typename T>
+            [[nodiscard]]
+            static const std::shared_ptr<shared_state<T>>& state(const task<T>& t) noexcept {
+                return t.st_;
+            }
+            template <typename T>
+            [[nodiscard]]
+            static std::shared_ptr<shared_state<T>> release(task<T>&& t) noexcept {
+                return std::move(t.st_);
+            }
+        };
+
         template <typename ParentState, typename F, typename U>
         struct map_cont final : cont_impl<ParentState, map_cont<ParentState, F, U>> {
             std::shared_ptr<shared_state<U>> dst;
@@ -481,7 +505,7 @@ namespace huxint::nexus {
             }
         };
 
-        /// @tparam InnerTask 用户绑定返回的任务类型(仅经其公共 st_ 成员接线,
+        /// @tparam InnerTask 用户绑定返回的任务类型(经 task_access 接线,
         ///                   完整性在实例化点成立)
         template <typename ParentState, typename F, typename InnerTask>
         struct and_then_cont final
@@ -514,7 +538,8 @@ namespace huxint::nexus {
                 if (!deliver(
                         parent,
                         [&](auto&&... v) {
-                            inner = std::invoke(fn, std::forward<decltype(v)>(v)...).st_;
+                            inner = task_access::release(
+                                std::invoke(fn, std::forward<decltype(v)>(v)...));
                         },
                         fail)) {
                     return;
@@ -596,10 +621,10 @@ namespace huxint::nexus {
             }
         };
 
-        /// OOM 出口声明(定义置于 task 完整定义之后)
+        /// 失败出口声明(定义置于 task 完整定义之后)
         template <typename T>
         [[nodiscard]]
-        task<T> failed_task() noexcept;
+        task<T> failed_task(std::exception_ptr e) noexcept;
 
         /// 续延体的结果类型: void 父任务的续延无参, 非 void 接收 T&&
         /// 特化而非 std::conditional_t, 避免 T=void 时形成 void&&
@@ -623,8 +648,6 @@ namespace huxint::nexus {
      * 单子表面: map(变换)/ and_then(绑定)/ inspect(旁观)均在完成任务
      * 的工作线程上内联执行, 构造期零入队. 结果值恰好可领取一次 - 不论经
      * get 还是某个续延, 其余领取者得到 invalid_task
-     *
-     * @note st_ 为库内接线成员, 勿在库外触碰
      */
     template <typename T>
     class task {
@@ -702,16 +725,19 @@ namespace huxint::nexus {
                 auto child = detail::make_state<U>();
                 auto* n = new (std::nothrow) Node{{}, child, std::forward<A>(a)...};
                 if (!n) {
-                    return detail::failed_task<U>();
+                    return detail::failed_task<U>(std::make_exception_ptr(std::bad_alloc{}));
                 }
                 detail::attach_or_run(*st_, n);
                 return task<U>{std::move(child)};
             } catch (...) {
-                return detail::failed_task<U>(); // make_state 的 bad_alloc
+                // make_state 的 bad_alloc, 或 f 拷贝/移动进节点时的用户异常:
+                // 原样进入结果通道, 不误标为 OOM
+                return detail::failed_task<U>(std::current_exception());
             }
         }
 
-    public:
+        friend struct detail::task_access;
+
         std::shared_ptr<state_t> st_;
     };
 
@@ -719,10 +745,10 @@ namespace huxint::nexus {
 
         template <typename T>
         [[nodiscard]]
-        task<T> failed_task() noexcept {
+        task<T> failed_task(std::exception_ptr e) noexcept {
             try {
                 auto st = make_state<T>();
-                st->set_exception(std::make_exception_ptr(std::bad_alloc{}));
+                st->set_exception(std::move(e));
                 st->finish();
                 return task<T>{std::move(st)};
             } catch (...) {
@@ -753,7 +779,8 @@ namespace huxint::nexus {
                     core->settle_one();
                 };
                 auto attach_one = [&]<std::size_t I>(task<Ts...[I]>& t) {
-                    if (!t.st_) [[unlikely]] {
+                    const auto& st = detail::task_access::state(t);
+                    if (!st) [[unlikely]] {
                         return miss(invalid_task_error()); // 无效入参: 具名标记沉淀, 不解引用
                     }
                     auto* node = new (std::nothrow)
@@ -762,15 +789,15 @@ namespace huxint::nexus {
                         // 单槽 OOM 降级为该槽失败, 不放大为整批失败
                         return miss(std::make_exception_ptr(std::bad_alloc{}));
                     }
-                    detail::attach_or_run(*t.st_, node);
+                    detail::attach_or_run(*st, node);
                 };
                 [&]<std::size_t... I>(std::index_sequence<I...>) {
                     (attach_one.template operator()<I>(ts...[I]), ...);
                 }(std::index_sequence_for<Ts...>{});
             }
             return task<std::tuple<Ts...>>{std::move(dst)};
-        } catch (...) {
-            return detail::failed_task<std::tuple<Ts...>>();
+        } catch (...) { // make_state / 汇合核心的 bad_alloc
+            return detail::failed_task<std::tuple<Ts...>>(std::current_exception());
         }
     }
 

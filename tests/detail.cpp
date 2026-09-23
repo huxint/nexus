@@ -257,7 +257,7 @@ TEST_SUITE("huxint::nexus.detail") {
         CHECK(received == std::vector{&nodes[0], &nodes[1], &nodes[2], &nodes[3], &nodes[4]});
     }
 
-    TEST_CASE("sbo_function_inplace_heap_and_move") {
+    TEST_CASE("sbo_function_inplace_and_heap") {
         int witness = 0;
         sbo_function<64> small{[&witness] { witness = 1; }}; // 捕获一个引用 => 就地存储
         CHECK(static_cast<bool>(small));
@@ -271,23 +271,25 @@ TEST_SUITE("huxint::nexus.detail") {
         big();
         CHECK(witness == 7);
 
-        // 移动后源置空, 目标可调用
-        sbo_function<64> moved = std::move(big);
+        big.reset();
         CHECK(!static_cast<bool>(big));
-        CHECK(static_cast<bool>(moved));
-        witness = 0;
-        moved();
-        CHECK(witness == 7);
-
-        moved.reset();
-        CHECK(!static_cast<bool>(moved));
 
         sbo_function<64> empty;
         CHECK(!static_cast<bool>(empty));
     }
 
-    // 移动赋值必须析构旧的可调用体, 否则生命周期计数泄漏
-    TEST_CASE("sbo_function_move_assign_destroys_old") {
+    // 调用实参原样转交可调用体(任务节点以 bool 区分执行与丢弃)
+    TEST_CASE("sbo_function_forwards_call_arguments") {
+        int seen = 0;
+        sbo_function<64, void(bool)> fn{[&seen](bool run) { seen = run ? 1 : 2; }};
+        fn(false);
+        CHECK(seen == 2);
+        fn(true);
+        CHECK(seen == 1);
+    }
+
+    // reset 与析构必须销毁可调用体, 否则生命周期计数泄漏
+    TEST_CASE("sbo_function_destroys_callable") {
         struct tracker {
             std::atomic<int>* live;
             explicit tracker(std::atomic<int>* c) : live(c) { live->fetch_add(1); }
@@ -302,7 +304,7 @@ TEST_SUITE("huxint::nexus.detail") {
             sbo_function<64> a{tracker{&live}};
             sbo_function<64> b{tracker{&live}};
             CHECK(live.load() == 2);
-            a = std::move(b); // 旧的 a 必须被析构
+            a.reset();
             CHECK(live.load() == 1);
         }
         CHECK(live.load() == 0);

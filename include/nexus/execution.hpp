@@ -10,6 +10,7 @@
 #include <stdexec/execution.hpp>
 #include <exception>
 #include <memory>
+#include <new>
 #include <type_traits>
 #include <utility>
 
@@ -33,10 +34,16 @@ namespace huxint::nexus::ex {
                 auto* self = this;
                 // receiver 的完成操作按 P2300 为 noexcept(stdexec 静态断言之),
                 // 故闭包天然满足 execute 的 noexcept 要求
-                if (!pool_->execute(
-                        [self]() noexcept { stdexec::set_value(std::move(self->rcvr_)); })) {
-                    // 池已关闭(OOM 同此): 提交被拒不等于完成 - 报停止
+                auto ok = pool_->execute(
+                    [self]() noexcept { stdexec::set_value(std::move(self->rcvr_)); });
+                if (ok) {
+                    return;
+                }
+                // 提交被拒不等于完成: 池已关闭报停止, 分配失败经错误通道报告
+                if (ok.error() == submit_error::stopped) {
                     stdexec::set_stopped(std::move(rcvr_));
+                } else {
+                    stdexec::set_error(std::move(rcvr_), std::make_exception_ptr(std::bad_alloc{}));
                 }
             }
 

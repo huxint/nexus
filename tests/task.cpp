@@ -332,10 +332,27 @@ TEST_SUITE("huxint::nexus.task") {
         t.request_stop(); // 不得崩溃
     }
 
+    // 回归: 组合子构造期 f 拷贝抛出的用户异常须原样进入结果通道,
+    // 不得被误标为 bad_alloc 而丢失真实成因
+    TEST_CASE("map_reports_callable_copy_exception_verbatim") {
+        struct throwing_copy {
+            throwing_copy() = default;
+            throwing_copy(const throwing_copy&) { throw std::runtime_error("copy failed"); }
+            int operator()(int x) const { return x; }
+        };
+        pool p({.threads = 1});
+        auto t = p.submit([] { return 1; });
+        REQUIRE(t.has_value());
+        const throwing_copy f;
+        auto r = t->map(f).get();
+        REQUIRE(!r.has_value());
+        CHECK_THROWS_AS(std::rethrow_exception(r.error()), std::runtime_error);
+    }
+
     // 回归: OOM 出口返回的任务须已发布完成, 否则 get() 在 done 等待上永久阻塞
     TEST_CASE("failed_task_completes_with_bad_alloc") {
         tu::deadlock_watchdog wd(10s, "failed_task_completes_with_bad_alloc");
-        auto r = detail::failed_task<int>().get();
+        auto r = detail::failed_task<int>(std::make_exception_ptr(std::bad_alloc{})).get();
         REQUIRE(!r.has_value());
         CHECK_THROWS_AS(std::rethrow_exception(r.error()), std::bad_alloc);
     }

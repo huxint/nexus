@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <bit>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -20,10 +21,15 @@ namespace huxint::nexus {
         struct cancellable_flag {};
         struct trace_flag {};
 
+        /// 容量合法性在标签类型上约束: 非法值(含 0)在写出标签处即编译失败,
+        /// 不会被当作"未提供"而静默替换为缺省值
         template <std::size_t N>
+            requires(N >= 1)
         struct worker_cap_flag {};
 
         template <std::size_t Global, std::size_t Local>
+            requires(Global >= 2 && std::has_single_bit(Global) && Local >= 2 &&
+                     std::has_single_bit(Local))
         struct queue_cap_flag {};
 
         /// queue_cap 标签的缺省容量. 全局环每槽按缓存行填充, 故容量直接
@@ -58,76 +64,49 @@ namespace huxint::nexus {
     namespace detail {
         // 标签以 `inline constexpr` 声明 -> decltype(标签) 携带顶层 const,
         // 以下所有判别均先剥离 cv 再比较, 避免 const 导致匹配失败
-        template <typename T>
-        inline constexpr bool is_priority_flag_v = std::same_as<std::remove_cv_t<T>, priority_flag>;
-        template <typename T>
-        inline constexpr bool is_cancellable_flag_v =
-            std::same_as<std::remove_cv_t<T>, cancellable_flag>;
-        template <typename T>
-        inline constexpr bool is_trace_flag_v = std::same_as<std::remove_cv_t<T>, trace_flag>;
+        template <typename Tag, typename... Flags>
+        inline constexpr bool has_flag_v = (std::same_as<std::remove_cv_t<Flags>, Tag> || ...);
 
+        /// 值标签的容量提取; 非该类标签取 0. 标签自身约束容量为正,
+        /// 故 0 只可能表示"未提供"
         template <typename T>
-        inline constexpr bool is_worker_cap_flag_impl_v = false;
+        inline constexpr std::size_t worker_cap_of = 0;
         template <std::size_t N>
-        inline constexpr bool is_worker_cap_flag_impl_v<worker_cap_flag<N>> = true;
-        template <typename T>
-        inline constexpr bool is_worker_cap_flag_v = is_worker_cap_flag_impl_v<std::remove_cv_t<T>>;
+        inline constexpr std::size_t worker_cap_of<worker_cap_flag<N>> = N;
 
         template <typename T>
-        inline constexpr bool is_queue_cap_flag_impl_v = false;
+        inline constexpr std::size_t global_cap_of = 0;
         template <std::size_t G, std::size_t L>
-        inline constexpr bool is_queue_cap_flag_impl_v<queue_cap_flag<G, L>> = true;
-        template <typename T>
-        inline constexpr bool is_queue_cap_flag_v = is_queue_cap_flag_impl_v<std::remove_cv_t<T>>;
+        inline constexpr std::size_t global_cap_of<queue_cap_flag<G, L>> = G;
 
-        /// 提取 queue_cap<Global, Local> 的容量; 0 表示未提供该值
         template <typename T>
-        struct queue_cap_value_impl {
-            static constexpr std::size_t global = 0;
-            static constexpr std::size_t local = 0;
-        };
+        inline constexpr std::size_t local_cap_of = 0;
         template <std::size_t G, std::size_t L>
-        struct queue_cap_value_impl<queue_cap_flag<G, L>> {
-            static constexpr std::size_t global = G;
-            static constexpr std::size_t local = L;
-        };
-        template <typename T>
-        struct queue_cap_value : queue_cap_value_impl<std::remove_cv_t<T>> {};
+        inline constexpr std::size_t local_cap_of<queue_cap_flag<G, L>> = L;
 
-        /// 聚合提取容量(至多一份 queue_cap 标签, 池侧 static_assert 限定):
-        /// 无标签时折叠为 0, 替换为缺省值
+        /// 同类值标签的出现次数(池侧 static_assert 限定至多一份)
+        template <typename... Flags>
+        inline constexpr std::size_t worker_cap_count_v =
+            (0uz + ... + (worker_cap_of<std::remove_cv_t<Flags>> != 0));
+        template <typename... Flags>
+        inline constexpr std::size_t queue_cap_count_v =
+            (0uz + ... + (global_cap_of<std::remove_cv_t<Flags>> != 0));
+
+        /// 聚合提取容量: 0 = 动态存储(未提供 worker_cap)
+        template <typename... Flags>
+        inline constexpr std::size_t worker_capacity_v =
+            std::max({worker_cap_of<std::remove_cv_t<Flags>>..., 0uz});
+
+        /// 无 queue_cap 标签时折叠为 0, 替换为缺省值
         template <typename... Flags>
         inline constexpr std::size_t queue_global_cap_v = [] {
-            constexpr std::size_t v = std::max({queue_cap_value<Flags>::global..., 0uz});
+            constexpr std::size_t v = std::max({global_cap_of<std::remove_cv_t<Flags>>..., 0uz});
             return v != 0 ? v : queue_cap_default_global;
         }();
         template <typename... Flags>
         inline constexpr std::size_t queue_local_cap_v = [] {
-            constexpr std::size_t v = std::max({queue_cap_value<Flags>::local..., 0uz});
+            constexpr std::size_t v = std::max({local_cap_of<std::remove_cv_t<Flags>>..., 0uz});
             return v != 0 ? v : queue_cap_default_local;
         }();
-
-        template <typename... Flags>
-        inline constexpr bool has_priority_v = (is_priority_flag_v<Flags> || ...);
-        template <typename... Flags>
-        inline constexpr bool has_cancellable_v = (is_cancellable_flag_v<Flags> || ...);
-        template <typename... Flags>
-        inline constexpr bool has_trace_v = (is_trace_flag_v<Flags> || ...);
-
-        /// 提取 worker_cap<N> 的容量; 0 表示动态存储(未提供标签)
-        template <typename T>
-        struct worker_cap_value_impl {
-            static constexpr std::size_t value = 0;
-        };
-        template <std::size_t N>
-        struct worker_cap_value_impl<worker_cap_flag<N>> {
-            static constexpr std::size_t value = N;
-        };
-        template <typename T>
-        struct worker_cap_value : worker_cap_value_impl<std::remove_cv_t<T>> {};
-
-        template <typename... Flags>
-        inline constexpr std::size_t worker_capacity_v =
-            (std::max({worker_cap_value<Flags>::value..., 0uz}));
     } // namespace detail
 } // namespace huxint::nexus

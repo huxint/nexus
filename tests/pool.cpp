@@ -769,6 +769,39 @@ TEST_SUITE("huxint.nexus") {
         CHECK(end == 1);
     }
 
+    // 回归: on_enqueue 须先于同一任务的 on_begin 触发(旧实现在入队并唤醒
+    // 之后才触发, 约六分之一的任务先被观测到 begin); 嵌套提交的 enqueue
+    // 发生在 worker 上, 须归因到该 worker 而非 no_worker
+    TEST_CASE("trace_enqueue_precedes_begin_and_attributes_nested_submit") {
+        constexpr std::uint64_t n = 20000;
+        std::mutex m;
+        std::vector<std::uint8_t> enqueued(n + 2, 0);
+        std::size_t inverted = 0;
+        std::size_t nested_on_worker = 0;
+        trace_hooks hooks;
+        hooks.on_enqueue = [&](trace_event e) noexcept {
+            std::scoped_lock lk(m);
+            enqueued[e.id] = 1;
+            nested_on_worker += e.worker != no_worker;
+        };
+        hooks.on_begin = [&](trace_event e) noexcept {
+            std::scoped_lock lk(m);
+            inverted += enqueued[e.id] == 0;
+        };
+        {
+            basic_pool<decltype(trace)> p({.threads = 4, .hooks = std::move(hooks)});
+            for (std::uint64_t i = 0; i + 1 < n; ++i) {
+                REQUIRE(p.execute([]() noexcept {}).has_value());
+            }
+            REQUIRE(p.execute([&p]() noexcept {
+                         static_cast<void>(p.execute([]() noexcept {}));
+                     }).has_value());
+            p.wait();
+        }
+        CHECK(inverted == 0);
+        CHECK(nested_on_worker == 1);
+    }
+
     TEST_CASE("trace_reports_cancelled_outcome") {
         std::mutex m;
         std::vector<task_outcome> ends;
@@ -957,6 +990,15 @@ TEST_SUITE("huxint.nexus") {
 
     // queue_cap 标签: 把两级容量都压到最小, 大批量提交几乎全程走溢出链,
     // 仍须一个不丢(正确性不依赖容量, 容量只影响快路径占比与内存)
+    // 容量合法性由标签类型约束: 0 不得被当作"未提供"而静默替换为缺省值
+    template <std::size_t G, std::size_t L>
+    concept valid_queue_cap = requires { typename detail::queue_cap_flag<G, L>; };
+    template <std::size_t N>
+    concept valid_worker_cap = requires { typename detail::worker_cap_flag<N>; };
+    static_assert(valid_queue_cap<2, 2> && valid_queue_cap<65536, 256>);
+    static_assert(!valid_queue_cap<0, 0> && !valid_queue_cap<0, 256> && !valid_queue_cap<24, 256>);
+    static_assert(valid_worker_cap<1> && !valid_worker_cap<0>);
+
     TEST_CASE("queue_cap_tiny_capacities_no_loss") {
         basic_pool<decltype(queue_cap<8, 2>)> p({.threads = 2});
         constexpr int n = 5000;

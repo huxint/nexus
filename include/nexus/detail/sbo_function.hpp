@@ -8,15 +8,17 @@
 
 namespace huxint::nexus::detail {
 
-    /// 小缓冲优化的移动专用函数. 可调用体不超过 SboBytes 时零堆分配
-    /// 调用签名固定为 R(). 构造时的堆分配仅发生在提交边界, 由调用方 catch
-    template <std::size_t SboBytes, typename R = void>
-    class sbo_function {
+    template <std::size_t SboBytes, typename Sig = void()>
+    class sbo_function;
+
+    /// 小缓冲优化的类型擦除函数, 就地驻留于宿主(任务节点)且不可移动.
+    /// 可调用体不超过 SboBytes 时零堆分配. 构造时的堆分配仅发生在提交边界,
+    /// 由调用方 catch
+    template <std::size_t SboBytes, typename R, typename... Args>
+    class sbo_function<SboBytes, R(Args...)> {
         struct vtable {
-            R (*invoke)(std::byte* self);
+            R (*invoke)(std::byte* self, Args... args);
             void (*destroy)(std::byte* self) noexcept;
-            /// 从 src 构造到 dst(就地模式移动对象; 堆模式复制指针), 不清空 src 的 vptr
-            void (*move)(std::byte* dst, std::byte* src) noexcept;
         };
 
         /// 就地存储的准入: 尺寸与对齐都落在缓冲内
@@ -27,14 +29,11 @@ namespace huxint::nexus::detail {
         template <typename FD>
         static const vtable* inplace_vt() noexcept {
             static const vtable vt{
-                [](std::byte* s) -> R { return (*std::launder(reinterpret_cast<FD*>(s)))(); },
+                [](std::byte* s, Args... args) -> R {
+                    return (*std::launder(reinterpret_cast<FD*>(s)))(std::forward<Args>(args)...);
+                },
                 [](std::byte* s) noexcept {
                     std::destroy_at(std::launder(reinterpret_cast<FD*>(s)));
-                },
-                [](std::byte* d, std::byte* s) noexcept {
-                    auto* f = std::launder(reinterpret_cast<FD*>(s));
-                    ::new (static_cast<void*>(d)) FD(std::move(*f));
-                    std::destroy_at(f);
                 },
             };
             return &vt;
@@ -43,11 +42,10 @@ namespace huxint::nexus::detail {
         template <typename FD>
         static const vtable* heap_vt() noexcept {
             static const vtable vt{
-                [](std::byte* s) -> R { return (**std::launder(reinterpret_cast<FD**>(s)))(); },
-                [](std::byte* s) noexcept { delete *std::launder(reinterpret_cast<FD**>(s)); },
-                [](std::byte* d, std::byte* s) noexcept {
-                    ::new (static_cast<void*>(d)) FD*(*std::launder(reinterpret_cast<FD**>(s)));
+                [](std::byte* s, Args... args) -> R {
+                    return (**std::launder(reinterpret_cast<FD**>(s)))(std::forward<Args>(args)...);
                 },
+                [](std::byte* s) noexcept { delete *std::launder(reinterpret_cast<FD**>(s)); },
             };
             return &vt;
         }
@@ -59,34 +57,12 @@ namespace huxint::nexus::detail {
 
         template <typename F>
             requires(!std::same_as<std::remove_cvref_t<F>, sbo_function>) &&
-                    std::is_invocable_r_v<R, std::decay_t<F>&>
+                    std::is_invocable_r_v<R, std::decay_t<F>&, Args...>
         sbo_function(F&& f) {
             emplace_with([&]() -> std::decay_t<F> { return std::forward<F>(f); });
         }
 
-        ~sbo_function() {
-            if (vt_) {
-                vt_->destroy(storage_);
-            }
-        }
-
-        sbo_function(sbo_function&& other) noexcept : vt_(other.vt_) {
-            if (vt_) {
-                vt_->move(storage_, other.storage_);
-                other.vt_ = nullptr;
-            }
-        }
-
-        sbo_function& operator=(sbo_function&& other) noexcept {
-            if (this != &other) {
-                reset();
-                if ((vt_ = other.vt_)) {
-                    vt_->move(storage_, other.storage_);
-                    other.vt_ = nullptr;
-                }
-            }
-            return *this;
-        }
+        ~sbo_function() { reset(); }
 
         sbo_function(const sbo_function&) = delete;
         sbo_function& operator=(const sbo_function&) = delete;
@@ -104,7 +80,7 @@ namespace huxint::nexus::detail {
          * @note make() 抛出时本对象保持为空, 存储原样可用
          */
         template <typename Factory>
-            requires std::is_invocable_r_v<R, std::decay_t<std::invoke_result_t<Factory>>&>
+            requires std::is_invocable_r_v<R, std::decay_t<std::invoke_result_t<Factory>>&, Args...>
         void emplace_with(Factory&& make) {
             using FD = std::decay_t<std::invoke_result_t<Factory>>;
             if constexpr (inplace<FD>) {
@@ -117,7 +93,7 @@ namespace huxint::nexus::detail {
             }
         }
 
-        R operator()() { return vt_->invoke(storage_); }
+        R operator()(Args... args) { return vt_->invoke(storage_, std::forward<Args>(args)...); }
 
         void reset() noexcept {
             if (vt_) {
