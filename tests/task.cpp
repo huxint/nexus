@@ -6,6 +6,7 @@
 #include <chrono>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -21,34 +22,30 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("map_transforms_success_value") {
         pool p({.threads = 4});
         auto t = p.submit([] { return 21; });
-        REQUIRE(t.has_value());
-        auto m = t->map([](int v) { return v * 2; });
+        auto m = t.map([](int v) { return v * 2; });
         CHECK(m.get().value_or(-1) == 42);
     }
 
     TEST_CASE("map_changes_type") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 7; });
-        REQUIRE(t.has_value());
-        auto m = t->map([](int v) { return std::to_string(v) + "!"; });
+        auto m = t.map([](int v) { return std::to_string(v) + "!"; });
         CHECK(m.get().value_or(std::string{}) == std::string("7!"));
     }
 
     TEST_CASE("map_chains") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 2; });
-        REQUIRE(t.has_value());
-        auto m = t->map([](int v) { return v + 3; }).map([](int v) { return v * 10; });
+        auto m = t.map([](int v) { return v + 3; }).map([](int v) { return v * 10; });
         CHECK(m.get().value_or(-1) == 50);
     }
 
     TEST_CASE("map_skips_failed_upstream") {
         pool p({.threads = 2});
         auto t = p.submit([]() -> int { throw std::runtime_error("upstream"); });
-        REQUIRE(t.has_value());
 
         std::atomic<int> called{0};
-        auto m = t->map([&called](int v) {
+        auto m = t.map([&called](int v) {
             called.fetch_add(1, std::memory_order_relaxed);
             return v;
         });
@@ -59,26 +56,23 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("map_own_throw_into_error_channel") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 1; });
-        REQUIRE(t.has_value());
-        auto m = t->map([](int) -> int { throw std::runtime_error("in map"); });
+        auto m = t.map([](int) -> int { throw std::runtime_error("in map"); });
         CHECK(!m.get().has_value());
     }
 
     TEST_CASE("map_on_completed_task_runs_inline") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 5; });
-        REQUIRE(t.has_value());
-        t->wait();                                    // 先等它跑完
-        auto m = t->map([](int v) { return v * v; }); // 再附着 => 走内联路径
+        t.wait();                                    // 先等它跑完
+        auto m = t.map([](int v) { return v * v; }); // 再附着 => 走内联路径
         CHECK(m.get().value_or(-1) == 25);
     }
 
     TEST_CASE("map_to_void_on_valued_task") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 5; });
-        REQUIRE(t.has_value());
         std::atomic<int> seen{0};
-        auto m = t->map([&seen](int v) { seen.store(v, std::memory_order_relaxed); });
+        auto m = t.map([&seen](int v) { seen.store(v, std::memory_order_relaxed); });
         CHECK(m.get().has_value());
         CHECK(seen.load() == 5);
     }
@@ -88,27 +82,24 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("value_claimed_once_across_get_and_continuations") {
         pool p({.threads = 2});
         auto t = p.submit([] { return std::string(64, 'x'); });
-        REQUIRE(t.has_value());
-        REQUIRE(t->get().has_value());
-        auto late = t->map([](std::string s) { return s.size(); });
+        REQUIRE(t.get().has_value());
+        auto late = t.map([](std::string s) { return s.size(); });
         auto r = late.get();
         REQUIRE(!r.has_value());
         CHECK(is_invalid_task(r.error()));
 
         auto u = p.submit([] { return 7; });
-        REQUIRE(u.has_value());
-        u->wait(); // 两个续延都走内联路径, 领取顺序确定
-        auto first = u->map([](int v) { return v; });
-        auto second = u->map([](int v) { return v; });
+        u.wait(); // 两个续延都走内联路径, 领取顺序确定
+        auto first = u.map([](int v) { return v; });
+        auto second = u.map([](int v) { return v; });
         CHECK(first.get().value_or(-1) == 7);
         auto r2 = second.get();
         REQUIRE(!r2.has_value());
         CHECK(is_invalid_task(r2.error()));
 
         auto w = p.submit([] { return 1; });
-        REQUIRE(w.has_value());
-        REQUIRE(w->get().has_value());
-        auto r3 = when_all(std::move(*w)).get();
+        REQUIRE(w.get().has_value());
+        auto r3 = when_all(std::move(w)).get();
         REQUIRE(!r3.has_value());
         CHECK(is_invalid_task(r3.error()));
     }
@@ -116,8 +107,7 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("map_on_void_task_invokes_without_args") {
         pool p({.threads = 2});
         auto t = p.submit([] {});
-        REQUIRE(t.has_value());
-        auto m = t->map([] { return 8; }); // void 上游 => 变换体无参
+        auto m = t.map([] { return 8; }); // void 上游 => 变换体无参
         CHECK(m.get().value_or(-1) == 8);
     }
 
@@ -127,9 +117,8 @@ TEST_SUITE("huxint::nexus.task") {
         g.block_all(p, 1);
 
         auto t = p.submit([](std::stop_token) { return 1; });
-        REQUIRE(t.has_value());
-        t->request_stop();
-        auto m = t->map([](int v) { return v + 1; });
+        t.request_stop();
+        auto m = t.map([](int v) { return v + 1; });
         g.release();
 
         auto r = m.get();
@@ -146,13 +135,12 @@ TEST_SUITE("huxint::nexus.task") {
         g.block_all(p, 2);
 
         auto t = p.submit([] { return 0; });
-        REQUIRE(t.has_value());
         constexpr int n = 100000;
         for (int i = 0; i < n; ++i) {
-            t = t->map([](int v) { return v + 1; });
+            t = t.map([](int v) { return v + 1; });
         }
         g.release();
-        CHECK(t->get().value_or(-1) == n);
+        CHECK(t.get().value_or(-1) == n);
     }
 
     // and_then
@@ -160,10 +148,8 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("and_then_binds_next_task") {
         pool p({.threads = 4});
         auto t = p.submit([] { return 5; });
-        REQUIRE(t.has_value());
-        auto chained = t->and_then([&p](int v) {
-            auto inner = p.submit([v] { return v * 10; });
-            return inner ? std::move(*inner) : task<int>{};
+        auto chained = t.and_then([&p](int v) {
+            return p.submit([v] { return v * 10; });
         });
         CHECK(chained.get().value_or(-1) == 50);
     }
@@ -171,10 +157,8 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("and_then_inner_failure_propagates") {
         pool p({.threads = 4});
         auto t = p.submit([] { return 5; });
-        REQUIRE(t.has_value());
-        auto chained = t->and_then([&p](int) {
-            auto inner = p.submit([]() -> int { throw std::runtime_error("inner"); });
-            return inner ? std::move(*inner) : task<int>{};
+        auto chained = t.and_then([&p](int) {
+            return p.submit([]() -> int { throw std::runtime_error("inner"); });
         });
         CHECK(!chained.get().has_value());
     }
@@ -182,13 +166,11 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("and_then_skips_failed_upstream") {
         pool p({.threads = 2});
         auto t = p.submit([]() -> int { throw std::runtime_error("up"); });
-        REQUIRE(t.has_value());
 
         std::atomic<int> called{0};
-        auto chained = t->and_then([&p, &called](int v) {
+        auto chained = t.and_then([&p, &called](int v) {
             called.fetch_add(1, std::memory_order_relaxed);
-            auto inner = p.submit([v] { return v; });
-            return inner ? std::move(*inner) : task<int>{};
+            return p.submit([v] { return v; });
         });
         CHECK(!chained.get().has_value());
         CHECK(called.load() == 0);
@@ -197,8 +179,7 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("and_then_fails_on_invalid_inner_task") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 1; });
-        REQUIRE(t.has_value());
-        auto chained = t->and_then([](int) { return task<int>{}; }); // 故意给无效任务
+        auto chained = t.and_then([](int) { return task<int>{}; }); // 故意给无效任务
         CHECK(!chained.get().has_value());
     }
 
@@ -207,10 +188,9 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("inspect_observes_without_changing_result") {
         pool p({.threads = 2});
         auto t = p.submit([] { return 3; });
-        REQUIRE(t.has_value());
 
         std::atomic<int> seen{-1};
-        auto ins = t->inspect([&seen](int& v) { seen.store(v, std::memory_order_release); });
+        auto ins = t.inspect([&seen](int& v) { seen.store(v, std::memory_order_release); });
         CHECK(ins.get().value_or(-1) == 3);
         CHECK(seen.load() == 3);
     }
@@ -218,10 +198,9 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("inspect_preserves_upstream_error") {
         pool p({.threads = 2});
         auto t = p.submit([]() -> int { throw std::runtime_error("e"); });
-        REQUIRE(t.has_value());
 
         std::atomic<int> called{0};
-        auto ins = t->inspect([&called](int&) { called.fetch_add(1, std::memory_order_relaxed); });
+        auto ins = t.inspect([&called](int&) { called.fetch_add(1, std::memory_order_relaxed); });
         CHECK(!ins.get().has_value());
         CHECK(called.load() == 0);
     }
@@ -233,11 +212,8 @@ TEST_SUITE("huxint::nexus.task") {
         auto a = p.submit([] { return 1; });
         auto b = p.submit([] { return std::string("two"); });
         auto c = p.submit([] { return 3.5; });
-        REQUIRE(a.has_value());
-        REQUIRE(b.has_value());
-        REQUIRE(c.has_value());
 
-        auto all = when_all(std::move(*a), std::move(*b), std::move(*c));
+        auto all = when_all(std::move(a), std::move(b), std::move(c));
         auto r = all.get();
         REQUIRE(r.has_value());
         CHECK(std::get<0>(*r) == 1);
@@ -249,9 +225,7 @@ TEST_SUITE("huxint::nexus.task") {
         pool p({.threads = 4});
         auto a = p.submit([] { return 1; });
         auto b = p.submit([]() -> int { throw std::runtime_error("bad"); });
-        REQUIRE(a.has_value());
-        REQUIRE(b.has_value());
-        auto all = when_all(std::move(*a), std::move(*b));
+        auto all = when_all(std::move(a), std::move(b));
         CHECK(!all.get().has_value());
     }
 
@@ -265,8 +239,7 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("when_all_single_task") {
         pool p({.threads = 2});
         auto a = p.submit([] { return 9; });
-        REQUIRE(a.has_value());
-        auto all = when_all(std::move(*a));
+        auto all = when_all(std::move(a));
         auto r = all.get();
         REQUIRE(r.has_value());
         CHECK(std::get<0>(*r) == 9);
@@ -276,23 +249,118 @@ TEST_SUITE("huxint::nexus.task") {
         pool p({.threads = 4});
         auto a = p.submit([] { return 100; });
         auto b = p.submit([] { return 200; });
-        REQUIRE(a.has_value());
-        REQUIRE(b.has_value());
 
-        auto sum = when_all(std::move(*a), std::move(*b)).map([](auto&& tup) {
+        auto sum = when_all(std::move(a), std::move(b)).map([](auto&& tup) {
             return std::get<0>(tup) + std::get<1>(tup);
         });
         CHECK(sum.get().value_or(-1) == 300);
+    }
+
+    // 元组值按元素展开: 续延不可整值调用时逐元素传参
+    TEST_CASE("map_unpacks_tuple_into_arguments") {
+        pool p({.threads = 4});
+        auto sum = when_all(p.submit([] { return 100; }), p.submit([] { return 2.5; }))
+                       .map([](int a, double b) { return a + b; });
+        CHECK(sum.get().value_or(-1.0) == 102.5);
+
+        std::atomic<int> seen{0};
+        auto peek = when_all(p.submit([] { return 1; }), p.submit([] { return 2; }))
+                        .inspect([&seen](int& a, int& b) { seen.store(a * 10 + b); });
+        CHECK(peek.get().has_value());
+        CHECK(seen.load() == 12);
+
+        auto bound = when_all(p.submit([] { return 3; }), p.submit([] { return 4; }))
+                         .and_then([&p](int a, int b) { return p.submit([=] { return a * b; }); });
+        CHECK(bound.get().value_or(-1) == 12);
+    }
+
+    TEST_CASE("when_all_range_collects_in_order") {
+        pool p({.threads = 4});
+        std::vector<task<int>> ts;
+        for (int i = 0; i < 50; ++i) {
+            ts.push_back(p.submit([i] { return i * i; }));
+        }
+        auto r = when_all(std::move(ts)).get();
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == std::size_t{50});
+        bool ordered = true;
+        for (int i = 0; i < 50; ++i) {
+            ordered &= ((*r)[static_cast<std::size_t>(i)] == i * i);
+        }
+        CHECK(ordered);
+    }
+
+    TEST_CASE("when_all_range_composes_with_submit_each") {
+        pool p({.threads = 4});
+        std::vector<int> xs{1, 2, 3, 4};
+        auto batch = p.submit_each(xs, [](int x) { return x * 10; });
+        REQUIRE(batch.has_value());
+        auto total = when_all(std::move(*batch)).map([](std::vector<int> v) {
+            return std::accumulate(v.begin(), v.end(), 0);
+        });
+        CHECK(total.get().value_or(-1) == 100);
+    }
+
+    TEST_CASE("when_all_range_void_tasks") {
+        pool p({.threads = 4});
+        std::atomic<int> ran{0};
+        std::vector<task<void>> ts;
+        for (int i = 0; i < 20; ++i) {
+            ts.push_back(p.submit([&ran] { ran.fetch_add(1, std::memory_order_relaxed); }));
+        }
+        CHECK(when_all(std::move(ts)).get().has_value());
+        CHECK(ran.load() == 20);
+    }
+
+    TEST_CASE("when_all_range_empty_and_failures") {
+        pool p({.threads = 2});
+        auto empty = when_all(std::vector<task<int>>{});
+        CHECK(empty.ready());
+        CHECK(empty.get().value_or(std::vector<int>{1}).empty());
+
+        std::vector<task<int>> ts;
+        ts.push_back(p.submit([] { return 1; }));
+        ts.push_back(p.submit([]() -> int { throw std::runtime_error("mid"); }));
+        ts.emplace_back(); // 无效句柄
+        auto r = when_all(std::move(ts)).get();
+        CHECK(!r.has_value());
+    }
+
+    TEST_CASE("when_all_range_move_only_results") {
+        pool p({.threads = 2});
+        std::vector<task<std::unique_ptr<int>>> ts;
+        for (int i = 0; i < 4; ++i) {
+            ts.push_back(p.submit([i] { return std::make_unique<int>(i); }));
+        }
+        auto r = when_all(std::move(ts)).get();
+        REQUIRE(r.has_value());
+        int sum = 0;
+        for (auto& e : *r) {
+            sum += *e;
+        }
+        CHECK(sum == 6);
+    }
+
+    TEST_CASE("ready_reports_completion_without_blocking") {
+        pool p({.threads = 1});
+        CHECK(!task<int>{}.ready());
+        tu::gate g;
+        g.block_all(p, 1);
+        auto t = p.submit([] { return 1; });
+        CHECK(!t.ready());
+        g.release();
+        t.wait();
+        CHECK(t.ready());
+        CHECK(t.get().value_or(-1) == 1);
     }
 
     // 回归: 含无效任务时绝不可组装未填充的槽位
     TEST_CASE("when_all_invalid_task_fails_safely") {
         pool p({.threads = 2});
         auto a = p.submit([] { return 1; });
-        REQUIRE(a.has_value());
 
         task<int> invalid;
-        auto all = when_all(std::move(*a), std::move(invalid));
+        auto all = when_all(std::move(a), std::move(invalid));
         CHECK(!all.get().has_value()); // 必须失败, 且不得读未初始化内存
     }
 
@@ -300,10 +368,8 @@ TEST_SUITE("huxint::nexus.task") {
         pool p({.threads = 4});
         auto a = p.submit([] { return std::make_unique<int>(11); });
         auto b = p.submit([] { return std::make_unique<int>(22); });
-        REQUIRE(a.has_value());
-        REQUIRE(b.has_value());
 
-        auto all = when_all(std::move(*a), std::move(*b));
+        auto all = when_all(std::move(a), std::move(b));
         auto r = all.get();
         REQUIRE(r.has_value());
         CHECK(*std::get<0>(*r) == 11);
@@ -342,9 +408,8 @@ TEST_SUITE("huxint::nexus.task") {
         };
         pool p({.threads = 1});
         auto t = p.submit([] { return 1; });
-        REQUIRE(t.has_value());
         const throwing_copy f;
-        auto r = t->map(f).get();
+        auto r = t.map(f).get();
         REQUIRE(!r.has_value());
         CHECK_THROWS_AS(std::rethrow_exception(r.error()), std::runtime_error);
     }
@@ -363,16 +428,14 @@ TEST_SUITE("huxint::nexus.task") {
         pool p({.threads = 2});
 
         auto v = p.submit([] {});
-        REQUIRE(v.has_value());
-        CHECK(v->get().has_value());
-        auto v2 = v->get();
+        CHECK(v.get().has_value());
+        auto v2 = v.get();
         REQUIRE(!v2.has_value());
         CHECK(is_invalid_task(v2.error()));
 
         auto i = p.submit([] { return 42; });
-        REQUIRE(i.has_value());
-        CHECK(i->get().value_or(0) == 42);
-        auto i2 = i->get();
+        CHECK(i.get().value_or(0) == 42);
+        auto i2 = i.get();
         REQUIRE(!i2.has_value());
         CHECK(is_invalid_task(i2.error()));
     }
@@ -400,11 +463,10 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("submit_error_of_recovers_submit_phase_failure") {
         pool p({.threads = 2});
         p.shutdown();
-        auto t = p.submit([] { return 1; });
-        REQUIRE(!t.has_value());
+        auto r = p.submit([] { return 1; }).get(); // 提交失败折入结果通道
+        REQUIRE(!r.has_value());
 
-        auto as_ptr = std::make_exception_ptr(t.error());
-        auto back = submit_error_of(as_ptr);
+        auto back = submit_error_of(r.error());
         REQUIRE(back.has_value());
         CHECK(*back == submit_error::stopped);
     }
@@ -422,8 +484,7 @@ TEST_SUITE("huxint::nexus.task") {
     TEST_CASE("move_only_result_through_result_channel") {
         pool p({.threads = 2});
         auto t = p.submit([] { return std::make_unique<std::string>("moved"); });
-        REQUIRE(t.has_value());
-        auto r = t->get();
+        auto r = t.get();
         REQUIRE(r.has_value());
         CHECK(**r == std::string("moved"));
     }
@@ -436,8 +497,7 @@ TEST_SUITE("huxint::nexus.task") {
 
         for (int i = 0; i < n; ++i) {
             auto t = p.submit([i] { return i; });
-            REQUIRE(t.has_value());
-            chained.push_back(t->map([](int v) { return v * 2; }));
+            chained.push_back(t.map([](int v) { return v * 2; }));
         }
         long sum = 0;
         for (auto& c : chained) {
@@ -453,8 +513,7 @@ TEST_SUITE("huxint::nexus.task") {
         {
             pool p({.threads = 2});
             auto t = p.submit([] { return tu::tracked{7}; });
-            REQUIRE(t.has_value());
-            t->wait(); // 只等完成, 从不 get(): 值就此留在共享状态里
+            t.wait(); // 只等完成, 从不 get(): 值就此留在共享状态里
             p.wait();
         }
         CHECK(tu::tracked::live.load() == base);
@@ -467,8 +526,7 @@ TEST_SUITE("huxint::nexus.task") {
             std::vector<task<tu::tracked>> handles;
             for (int i = 0; i < 64; ++i) {
                 auto t = p.submit([i] { return tu::tracked{i}; });
-                REQUIRE(t.has_value());
-                handles.push_back(std::move(*t));
+                handles.push_back(std::move(t));
             }
             p.wait();
             handles.clear(); // 一个都不 get, 直接丢弃全部句柄
@@ -482,9 +540,7 @@ TEST_SUITE("huxint::nexus.task") {
             pool p({.threads = 2});
             auto a = p.submit([] { return tu::tracked{1}; });
             auto b = p.submit([] { return tu::tracked{2}; });
-            REQUIRE(a.has_value());
-            REQUIRE(b.has_value());
-            auto joined = when_all(std::move(*a), std::move(*b));
+            auto joined = when_all(std::move(a), std::move(b));
             joined.wait(); // tuple 已装配进共享状态, 但从不取走
             p.wait();
         }
@@ -496,8 +552,7 @@ TEST_SUITE("huxint::nexus.task") {
         {
             pool p({.threads = 2});
             auto t = p.submit([] { return tu::tracked{3}; });
-            REQUIRE(t.has_value());
-            auto mapped = t->map([](tu::tracked&& x) { return tu::tracked{x.v * 2}; });
+            auto mapped = t.map([](tu::tracked&& x) { return tu::tracked{x.v * 2}; });
             mapped.wait(); // 父任务的值已被续延取走, 子任务的值无人认领
             p.wait();
         }
@@ -510,8 +565,7 @@ TEST_SUITE("huxint::nexus.task") {
         {
             pool p({.threads = 2});
             auto t = p.submit([] { return tu::copy_only{5}; });
-            REQUIRE(t.has_value());
-            auto r = t->get();
+            auto r = t.get();
             REQUIRE(r.has_value());
             CHECK(r->v == 5);
         }
@@ -523,8 +577,7 @@ TEST_SUITE("huxint::nexus.task") {
         {
             pool p({.threads = 2});
             auto t = p.submit([] { return tu::copy_only{9}; });
-            REQUIRE(t.has_value());
-            t->wait();
+            t.wait();
             p.wait();
         }
         CHECK(tu::copy_only::live.load() == base);

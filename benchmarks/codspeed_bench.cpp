@@ -54,8 +54,8 @@ namespace {
             c.value.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        static_cast<void>(p.fork_join([&p, depth, &c]() noexcept { spawn_tree(p, depth - 1, c); },
-                                      [&p, depth, &c]() noexcept { spawn_tree(p, depth - 1, c); }));
+        p.fork_join([&p, depth, &c]() noexcept { spawn_tree(p, depth - 1, c); },
+                                      [&p, depth, &c]() noexcept { spawn_tree(p, depth - 1, c); });
     }
 
 } // namespace
@@ -70,9 +70,7 @@ static void BM_submit_then_get(benchmark::State& state) {
     handles.reserve(count);
     for (auto _ : state) {
         for (std::size_t i = 0; i < count; ++i) {
-            if (auto t = p.submit([](std::size_t x) noexcept { return x * 2; }, i)) {
-                handles.push_back(std::move(*t));
-            }
+            handles.push_back(p.submit([](std::size_t x) noexcept { return x * 2; }, i));
         }
         std::size_t sum = 0;
         for (auto& t : handles) {
@@ -110,9 +108,7 @@ static void BM_idle_roundtrip(benchmark::State& state) {
     for (auto _ : state) {
         std::size_t sum = 0;
         for (std::size_t i = 0; i < count; ++i) {
-            if (auto t = p.submit([](std::size_t x) noexcept { return x + 1; }, i)) {
-                sum += t->get().value_or(0);
-            }
+            sum += p.submit([](std::size_t x) noexcept { return x + 1; }, i).get().value_or(0);
         }
         benchmark::DoNotOptimize(sum);
     }
@@ -122,15 +118,15 @@ BENCHMARK(BM_idle_roundtrip)->Arg(64);
 // priority 标签: 三档轮转提交, 走分层队列的层选择与扫描路径
 static void BM_priority_execute(benchmark::State& state) {
     const auto count = static_cast<std::size_t>(state.range(0));
-    basic_pool<decltype(priority)> p({.threads = BENCH_THREADS});
+    basic_pool<priority> p({.threads = BENCH_THREADS});
     counter c;
     constexpr task_priority levels[] = {task_priority::high, task_priority::normal,
                                         task_priority::low};
     for (auto _ : state) {
         for (std::size_t i = 0; i < count; ++i) {
-            static_cast<void>(p.execute(levels[i % 3], [&c]() noexcept {
+            p.execute(levels[i % 3], [&c]() noexcept {
                 c.value.fetch_add(1, std::memory_order_relaxed);
-            }));
+            });
         }
         p.wait();
     }
@@ -148,8 +144,7 @@ static void BM_parallel_for(benchmark::State& state) {
     std::vector<std::uint64_t> data(count, 1);
     pool p(bench_options());
     for (auto _ : state) {
-        static_cast<void>(
-            parallel_for(p, data, [](std::uint64_t& x) noexcept { x = x * 3 + 1; }).run());
+        static_cast<void>(parallel_for(p, data, [](std::uint64_t& x) noexcept { x = x * 3 + 1; }));
         benchmark::ClobberMemory();
     }
     benchmark::DoNotOptimize(data.front());
@@ -163,14 +158,13 @@ static void BM_parallel_for_chunked(benchmark::State& state) {
     pool p(bench_options());
     for (auto _ : state) {
         static_cast<void>(parallel_for_chunked(
-                              p, data,
-                              [](auto&& chunk) noexcept {
-                                  for (auto& x : chunk) {
-                                      x = x * 3 + 1;
-                                  }
-                              },
-                              64)
-                              .run());
+            p, data,
+            [](auto&& chunk) noexcept {
+                for (auto& x : chunk) {
+                    x = x * 3 + 1;
+                }
+            },
+            64));
         benchmark::ClobberMemory();
     }
     benchmark::DoNotOptimize(data.front());
@@ -201,14 +195,10 @@ static void BM_when_all_map(benchmark::State& state) {
     for (auto _ : state) {
         std::size_t sum = 0;
         for (std::size_t i = 0; i < count; ++i) {
-            auto a = p.submit([]() noexcept { return 100uz; });
-            auto b = p.submit([]() noexcept { return 200uz; });
-            if (a && b) {
-                auto merged = when_all(std::move(*a), std::move(*b)).map([](auto&& tup) noexcept {
-                    return std::get<0>(tup) + std::get<1>(tup);
-                });
-                sum += merged.get().value_or(0);
-            }
+            auto merged = when_all(p.submit([]() noexcept { return 100uz; }),
+                                   p.submit([]() noexcept { return 200uz; }))
+                              .map([](std::size_t a, std::size_t b) noexcept { return a + b; });
+            sum += merged.get().value_or(0);
         }
         benchmark::DoNotOptimize(sum);
     }
@@ -222,14 +212,13 @@ static void BM_task_continuation_chain(benchmark::State& state) {
     for (auto _ : state) {
         std::size_t sum = 0;
         for (std::size_t i = 0; i < count; ++i) {
-            if (auto t = p.submit([]() noexcept { return 1uz; })) {
-                auto chained =
-                    t->map([](std::size_t x) noexcept { return x + 1; })
-                        .map([](std::size_t x) noexcept { return x * 2; })
-                        .inspect([](std::size_t& x) noexcept { benchmark::DoNotOptimize(x); })
-                        .map([](std::size_t x) noexcept { return x - 1; });
-                sum += chained.get().value_or(0);
-            }
+            auto chained =
+                p.submit([]() noexcept { return 1uz; })
+                    .map([](std::size_t x) noexcept { return x + 1; })
+                    .map([](std::size_t x) noexcept { return x * 2; })
+                    .inspect([](std::size_t& x) noexcept { benchmark::DoNotOptimize(x); })
+                    .map([](std::size_t x) noexcept { return x - 1; });
+            sum += chained.get().value_or(0);
         }
         benchmark::DoNotOptimize(sum);
     }
@@ -287,8 +276,7 @@ namespace {
         static pool_t make() { return pool({.threads = BENCH_THREADS}); }
         static void run_batch(pool_t& p, counter& c, std::size_t count) {
             for (std::size_t i = 0; i < count; ++i) {
-                static_cast<void>(
-                    p.execute([&c]() noexcept { c.value.fetch_add(1, std::memory_order_relaxed); }));
+                p.execute([&c]() noexcept { c.value.fetch_add(1, std::memory_order_relaxed); });
             }
             p.wait();
         }

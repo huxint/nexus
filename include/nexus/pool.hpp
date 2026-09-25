@@ -82,6 +82,9 @@ namespace huxint::nexus {
         template <typename F, typename... Args>
         using submit_result_t = typename submit_result<F, Args...>::type;
 
+        /// 池私有设施的库内访问口: 批量汇合(parallel_for)经此接线
+        struct pool_access;
+
     } // namespace detail
 
     /**
@@ -96,7 +99,8 @@ namespace huxint::nexus {
      * 空闲判定在两次稳定的提交快照之间核对完成总数, 同时取得任务写入的
      * 可见性. 关闭闸门与提交登记以 seq_cst 定序(见 admit)
      *
-     * 零 throw: 库自身的一切失败经 std::expected 报告; 任务体异常被捕获并透传至
+     * 零 throw: 库自身的一切失败经 std::expected 或任务的结果通道报告(submit
+     * 的提交失败折入 task, 经 submit_error_of 还原); 任务体异常被捕获并透传至
      * 结果通道; execute 要求 callable 为 noexcept - 从类型系统保证遗忘型任务零
      * 异常逃逸(连带排斥了拷贝构造会抛的实参). 唯一的例外是 submit / submit_each
      * 在提交期运行的**用户代码** - callable 与实参的拷贝/移动构造: 其中的
@@ -106,28 +110,30 @@ namespace huxint::nexus {
      * 取消: 每个任务状态都带取消标志, 未开跑即取消的任务体被跳过并标记
      * operation_cancelled; 真正的 stop_source 仅在 callable 轮询 token 时实体化
      *
-     * @tparam Flags 特性标签: priority / cancellable / trace / worker_cap<N> /
-     *                queue_cap<Global, Local>
+     * @tparam Flags 特性标签(值, 无序): priority / cancellable / trace / worker_cap<N> /
+     *               queue_cap<Global, Local>, 如 basic_pool<priority, trace>
      */
-    template <typename... Flags>
+    template <auto... Flags>
+        requires(detail::pool_flag<decltype(Flags)> && ...)
     class basic_pool {
-        static_assert(detail::worker_cap_count_v<Flags...> <= 1,
+        static_assert(detail::worker_cap_count_v<decltype(Flags)...> <= 1,
                       "worker_cap<N> may appear at most once");
-        static_assert(detail::queue_cap_count_v<Flags...> <= 1,
+        static_assert(detail::queue_cap_count_v<decltype(Flags)...> <= 1,
                       "queue_cap<Global, Local> may appear at most once");
 
-        static constexpr bool PRIORITY = detail::has_flag_v<detail::priority_flag, Flags...>;
-        static constexpr bool TRACE = detail::has_flag_v<detail::trace_flag, Flags...>;
+        static constexpr bool PRIORITY =
+            detail::has_flag_v<detail::priority_flag, decltype(Flags)...>;
+        static constexpr bool TRACE = detail::has_flag_v<detail::trace_flag, decltype(Flags)...>;
         /// cancellable 标签约束"返回取消源的 execute 重载"的可见性;
         /// submit 的 token 感知不受此限制(状态自带取消标志)
         static constexpr bool CANCELLABLE_TAG =
-            detail::has_flag_v<detail::cancellable_flag, Flags...>;
+            detail::has_flag_v<detail::cancellable_flag, decltype(Flags)...>;
         static constexpr int LEVELS = PRIORITY ? 3 : 1;
-        static constexpr std::size_t WORKER_CAP = detail::worker_capacity_v<Flags...>;
+        static constexpr std::size_t WORKER_CAP = detail::worker_capacity_v<decltype(Flags)...>;
         /// 本地 deque / 全局环每层容量, 由 queue_cap<Global, Local> 标签配置
         /// (合法性由标签类型约束, 取舍与缺省见 tags.hpp)
-        static constexpr std::size_t LOCAL_CAP = detail::queue_local_cap_v<Flags...>;
-        static constexpr std::size_t GLOBAL_CAP = detail::queue_global_cap_v<Flags...>;
+        static constexpr std::size_t LOCAL_CAP = detail::queue_local_cap_v<decltype(Flags)...>;
+        static constexpr std::size_t GLOBAL_CAP = detail::queue_global_cap_v<decltype(Flags)...>;
         /// 每 worker 空闲节点缓存上限. 无上限时外部线程持续提交会让缓存长度
         /// 随累计任务数单调增长(节点归还进执行者的缓存, 外部生产者永远不来取)
         static constexpr std::size_t NODE_CACHE_CAP = 1024;
@@ -288,6 +294,10 @@ namespace huxint::nexus {
          * callable 可接受 `const std::stop_token&` 首参以获得协作取消能力;
          * 返回的 task 携带 request_stop(). 结果值恰好可取一次
          *
+         * 提交失败(池已关闭 / 内存不足)同样折入结果通道: 返回的 task 已完成,
+         * get() 的错误经 submit_error_of 还原为 submit_error. 故提交与组合可
+         * 直接串联: `when_all(p.submit(a), p.submit(b)).map(...)`
+         *
          * @throws 提交期由**用户代码**(callable 与实参的拷贝/移动构造)抛出的
          *         非 bad_alloc 异常原样透传; bad_alloc 折成 out_of_memory
          */
@@ -295,13 +305,9 @@ namespace huxint::nexus {
             requires(!std::same_as<std::remove_cvref_t<F>, task_priority>) &&
                     detail::submittable<F, Args...> // 不可调用对象在重载处即报, 而非深入实现后才报
         [[nodiscard]]
-        auto submit(F&& f, Args&&... args)
-            -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
-            using R = detail::submit_result_t<F, Args...>;
-            return guard_oom([&] {
-                return submit_impl<R>(task_priority::normal, std::forward<F>(f),
-                                      std::forward<Args>(args)...);
-            });
+        auto submit(F&& f, Args&&... args) -> task<detail::submit_result_t<F, Args...>> {
+            return submit_impl<detail::submit_result_t<F, Args...>>(
+                task_priority::normal, std::forward<F>(f), std::forward<Args>(args)...);
         }
 
         /// 提交带优先级的任务 @requires priority 标签
@@ -309,11 +315,9 @@ namespace huxint::nexus {
             requires(PRIORITY) && detail::submittable<F, Args...>
         [[nodiscard]]
         auto submit(task_priority prio, F&& f, Args&&... args)
-            -> std::expected<task<detail::submit_result_t<F, Args...>>, submit_error> {
-            using R = detail::submit_result_t<F, Args...>;
-            return guard_oom([&] {
-                return submit_impl<R>(prio, std::forward<F>(f), std::forward<Args>(args)...);
-            });
+            -> task<detail::submit_result_t<F, Args...>> {
+            return submit_impl<detail::submit_result_t<F, Args...>>(
+                prio, std::forward<F>(f), std::forward<Args>(args)...);
         }
 
         /**
@@ -340,67 +344,34 @@ namespace huxint::nexus {
             using R = detail::submit_result_t<F, elem_t>;
 
             std::vector<task<R>> out;
-            std::vector<std::pair<node_t*, tracer_t>> staged;
-            // 半成品的回收: 终结其状态防悬挂. 构建抛出时的占位槽为空, 不在范围内
-            auto rollback = [&]() noexcept {
-                for (node_t* n : staged | std::views::keys) {
-                    if (n) {
-                        abandon(n);
-                    }
+            auto ok = emit_each(rng, [&](auto&& e) -> std::pair<node_t*, tracer_t> {
+                // 句柄槽先于节点备好: 节点一经建成即归骨架回滚, 其后的登记不得再抛
+                if (out.size() == out.capacity()) {
+                    out.reserve(out.empty() ? 16 : out.capacity() * 2);
                 }
-            };
-
-            // 阶段一: 整体构建. 先占位再建节点, 容器扩容抛出时没有游离的半成品
-            try {
-                if constexpr (std::ranges::sized_range<Rng>) {
-                    const auto n = static_cast<std::size_t>(std::ranges::size(rng));
-                    out.reserve(n);
-                    staged.reserve(n);
-                }
-                for (auto&& e : rng) {
-                    auto& slot = staged.emplace_back();
-                    std::shared_ptr<detail::shared_state<R>> st;
-                    slot = build_submit_node(task_priority::normal, st, f,
-                                             elem_t(std::forward<decltype(e)>(e)));
-                    if (!slot.first) [[unlikely]] {
-                        rollback();
-                        return std::unexpected(submit_error::out_of_memory);
-                    }
+                std::shared_ptr<detail::shared_state<R>> st;
+                auto built = build_submit_node(task_priority::normal, st, f,
+                                               elem_t(std::forward<decltype(e)>(e)));
+                if (built.first) {
                     out.emplace_back(std::move(st));
                 }
-            } catch (const std::bad_alloc&) { // 容器扩容或闭包堆存储
-                rollback();
-                return std::unexpected(submit_error::out_of_memory);
-            } catch (...) { // F/元素拷贝的用户异常原样透传
-                rollback();
-                throw;
-            }
-
-            // 阶段二: 整批一次登记, 获准后依序发布, 单次唤醒. 被拒时整批以
-            // 取消语义终结, 不存在"部分已入队而句柄随错误丢弃"的中间态
-            if (staged.empty()) {
-                return out;
-            }
-            if (auto ok = admit(staged.size(), rollback); !ok) {
+                return built;
+            });
+            if (!ok) {
                 return std::unexpected(ok.error());
             }
-            constexpr int level = level_of(task_priority::normal);
-            for (const auto& [node, tracer] : staged) {
-                publish(level, node, tracer);
-            }
-            notify_wake_n(staged.size());
             return out;
         }
 
         /**
          * @brief 即发即忘执行(无结果通道). callable 必须 noexcept - 编译期强制
          *
-         * @return 失败仅在提交边界发生(池已停 / 内存不足)
+         * @return 失败仅在提交边界发生(池已停 / 内存不足). 即发即忘的调用方
+         *         通常不关心, 故不强制检查
          */
         template <typename F, typename... Args>
             requires(std::is_nothrow_invocable_v<F, Args...>)
-        [[nodiscard]]
-        std::expected<void, submit_error> execute(F&& f, Args&&... args) {
+        submit_status execute(F&& f, Args&&... args) {
             return guard_oom([&] {
                 return execute_impl(task_priority::normal, std::forward<F>(f),
                                     std::forward<Args>(args)...);
@@ -410,8 +381,7 @@ namespace huxint::nexus {
         /// 即发即忘 + 优先级 @requires priority 标签
         template <typename F, typename... Args>
             requires(PRIORITY && std::is_nothrow_invocable_v<F, Args...>)
-        [[nodiscard]]
-        std::expected<void, submit_error> execute(task_priority prio, F&& f, Args&&... args) {
+        submit_status execute(task_priority prio, F&& f, Args&&... args) {
             return guard_oom(
                 [&] { return execute_impl(prio, std::forward<F>(f), std::forward<Args>(args)...); });
         }
@@ -458,8 +428,7 @@ namespace huxint::nexus {
          */
         template <typename F1, typename F2>
             requires std::is_nothrow_invocable_v<F1&>
-        [[nodiscard]]
-        std::expected<void, submit_error> fork_join(F1&& f, F2&& g) {
+        submit_status fork_join(F1&& f, F2&& g) {
             // 先入队的 f 先可窃取, 再跑内联分支(work-first). g 置于 OOM 守卫之外:
             // 其异常(含 bad_alloc)属直接调用语义, 不得被折成提交失败
             auto ok = guard_oom(
@@ -545,7 +514,7 @@ namespace huxint::nexus {
         }
 
     private:
-        /// submit / execute 的公共外壳: 提交路径唯一允许逃逸的异常是分配
+        /// execute 系列的公共外壳: 提交路径唯一允许逃逸的异常是分配
         /// 失败, 就地转入 expected 的错误通道(库表面零 throw). 其余异常
         /// (F 与实参的拷贝/移动)属用户代码, 原样透传
         template <typename Impl>
@@ -634,15 +603,135 @@ namespace huxint::nexus {
             return node;
         }
 
-        /// 单任务提交的收尾: 登记 + 发布 + 唤醒一个 worker
+        /// 单任务提交的收尾: 登记 + 发布 + 唤醒一个 worker. 被拒的节点不经
+        /// run=false 收尾(那是排队丢弃的取消语义), 闭包直接析构后节点归还;
+        /// 有结果通道的调用方随后自行以 stopped 终结状态
         std::expected<void, submit_error> emit(node_t* node, task_priority prio,
                                                const tracer_t& tracer) noexcept {
-            if (auto ok = admit(1, [&]() noexcept { abandon(node); }); !ok) {
+            if (auto ok = admit(1, [&]() noexcept { release_unrun(node); }); !ok) {
                 return ok;
             }
             publish(level_of(prio), node, tracer);
             notify_wake();
             return {};
+        }
+
+        /**
+         * @brief 两阶段批量提交骨架(submit_each / execute_each 共用)
+         *
+         *  - 阶段一逐元素经 build(e) 构建节点(不入队), 构建期失败整体回滚,
+         *    无半成品; 先占位再建节点, 容器扩容抛出时没有游离的半成品;
+         *  - 阶段二整批一次登记, 仅 stopping 可败 - 此时整批以取消语义终结,
+         *    无一入队; 获准则依序发布, 按批唤醒
+         *
+         * @param build 元素 -> (节点, trace 句柄); 节点为空 = 仅因 bad_alloc,
+         *              其余异常(用户代码)原样透传
+         */
+        template <typename Rng, typename Build>
+        std::expected<void, submit_error> emit_each(Rng&& rng, Build&& build) {
+            std::vector<std::pair<node_t*, tracer_t>> staged;
+            // 构建抛出时的占位槽为空, 不在回收范围内
+            auto rollback = [&]() noexcept {
+                for (node_t* n : staged | std::views::keys) {
+                    if (n) {
+                        abandon(n);
+                    }
+                }
+            };
+
+            try {
+                if constexpr (std::ranges::sized_range<Rng>) {
+                    staged.reserve(static_cast<std::size_t>(std::ranges::size(rng)));
+                }
+                for (auto&& e : rng) {
+                    auto& slot = staged.emplace_back();
+                    slot = build(std::forward<decltype(e)>(e));
+                    if (!slot.first) [[unlikely]] {
+                        rollback();
+                        return std::unexpected(submit_error::out_of_memory);
+                    }
+                }
+            } catch (const std::bad_alloc&) { // 容器扩容或闭包堆存储
+                rollback();
+                return std::unexpected(submit_error::out_of_memory);
+            } catch (...) { // 用户代码(callable/元素拷贝)的异常原样透传
+                rollback();
+                throw;
+            }
+
+            if (staged.empty()) {
+                return {};
+            }
+            if (auto ok = admit(staged.size(), rollback); !ok) {
+                return ok;
+            }
+            constexpr int level = level_of(task_priority::normal);
+            for (const auto& [node, tracer] : staged) {
+                publish(level, node, tracer);
+            }
+            notify_wake_n(staged.size());
+            return {};
+        }
+
+        /// 整批即发即忘(parallel_for 的底座): make(e) 返回 noexcept 的 void(bool run)
+        /// 可调用体, run 语义同 task_node::body - 被丢弃的元素也经它收尾
+        template <typename Rng, typename Make>
+        std::expected<void, submit_error> execute_each(Rng&& rng, Make&& make) {
+            return emit_each(rng, [&](auto&& e) -> std::pair<node_t*, tracer_t> {
+                const tracer_t tracer = make_tracer(task_priority::normal);
+                node_t* node = make_node([&] {
+                    return task_closure{tracer, [g = make(std::forward<decltype(e)>(e))](
+                                                    bool run, const tracer_t& tr) mutable noexcept {
+                                            if (!run) {
+                                                g(false);
+                                                return;
+                                            }
+                                            tr.begin();
+                                            g(true);
+                                            tr.end(task_outcome::completed);
+                                        }};
+                });
+                return {node, tracer};
+            });
+        }
+
+        /**
+         * @brief 帮助式汇合: 阻塞至 done() 成立
+         *
+         * 调用者是本池 worker 时边等边执行排队任务 - 嵌套的批量汇合不会因
+         * 全部 worker 同时阻塞而死锁, 等待期间的核也不空转. 各队列都取不到活时
+         * 调用 block() 睡眠: 此刻所等的工作要么已在别的线程上运行, 要么尚在
+         * 转运中而终将被执行, 睡下不会失去进展. 非 worker 调用者直接 block
+         *
+         * @param block 睡眠至"可能已有进展"(返回后重新检查 done)
+         */
+        template <typename Done, typename Block>
+        void help_until(Done&& done, Block&& block) noexcept {
+            if (!in_own_worker()) {
+                while (!done()) {
+                    block();
+                }
+                return;
+            }
+            const std::size_t idx = detail::tls_worker;
+            std::uint32_t seed = static_cast<std::uint32_t>(idx) * 0x9E3779B9u + 1u;
+            while (!done()) {
+                if (node_t* n = try_acquire(idx, seed)) {
+                    execute_node(n, idx);
+                } else {
+                    block();
+                }
+            }
+        }
+
+        /// 睡在空闲代际上直至 done() 可能成立; done 的置位方须随后调用 bump_idle.
+        /// 先读代际再查判据: 置位若晚于本次读取, 其推进必令 wait 立即返回
+        template <typename Done>
+        void sleep_until_bumped(Done&& done) const noexcept {
+            const std::uint32_t g = idle_gen_.load(std::memory_order_acquire);
+            if (!done()) {
+                idle_gen_.wait(g);
+            }
         }
 
         /// 构建 submit 型节点(状态 + 闭包), 未入队
@@ -688,17 +777,34 @@ namespace huxint::nexus {
         }
 
         template <typename R, typename F, typename... Args>
-        std::expected<task<R>, submit_error> submit_impl(task_priority prio, F&& f,
-                                                         Args&&... args) {
+        task<R> submit_impl(task_priority prio, F&& f, Args&&... args) {
             std::shared_ptr<detail::shared_state<R>> st;
-            auto [node, tracer] =
-                build_submit_node(prio, st, std::forward<F>(f), std::forward<Args>(args)...);
+            std::pair<node_t*, tracer_t> built{};
+            try {
+                built = build_submit_node(prio, st, std::forward<F>(f), std::forward<Args>(args)...);
+            } catch (const std::bad_alloc&) { // 闭包堆存储; 其余用户异常原样透传
+            }
+            const auto& [node, tracer] = built;
             if (!node) [[unlikely]] {
-                return std::unexpected(submit_error::out_of_memory);
+                return failed_submit(std::move(st), submit_error::out_of_memory);
             }
             if (auto ok = emit(node, prio, tracer); !ok) {
-                return std::unexpected(ok.error());
+                return failed_submit(std::move(st), ok.error());
             }
+            return task<R>{std::move(st)};
+        }
+
+        /// 提交失败折入结果通道. 状态从未交给其他线程, 就地终结即可;
+        /// 连状态都未分配出来时退回独立的失败任务
+        template <typename R>
+        [[nodiscard]]
+        static task<R> failed_submit(std::shared_ptr<detail::shared_state<R>> st,
+                                     submit_error e) noexcept {
+            if (!st) [[unlikely]] {
+                return detail::failed_task<R>(detail::submit_error_ptr(e));
+            }
+            st->set_exception(detail::submit_error_ptr(e));
+            st->finish();
             return task<R>{std::move(st)};
         }
 
@@ -855,8 +961,7 @@ namespace huxint::nexus {
         /// 执行一个节点并回收. body 在执行后立即析构 - 否则其捕获的实参与
         /// 共享状态引用会一直存活到该节点被复用/销毁, 形成可观的内存滞留
         void execute_node(node_t* n, std::size_t worker) noexcept {
-            n->body(true);
-            n->body.reset();
+            n->body.consume(true);
             recycle_node(n, worker);
             complete_one(worker);
         }
@@ -884,7 +989,7 @@ namespace huxint::nexus {
             }
         }
 
-        /// 提交路径上的归还(闭包构建失败): 调用方未必是本池 worker
+        /// 提交路径上的归还(闭包构建失败 / 提交被拒): 调用方未必是本池 worker
         void release_node(node_t* n) noexcept {
             if (in_own_worker()) {
                 recycle_node(n, detail::tls_worker);
@@ -1035,9 +1140,15 @@ namespace huxint::nexus {
         /// 回收的空壳节点闭包已清空, 等价于直接销毁
         void abandon(node_t* n) noexcept {
             if (n->body) {
-                n->body(false);
+                n->body.consume(false);
             }
             delete n;
+        }
+
+        /// 提交被拒的节点: 闭包不经 run=false 收尾而直接析构, 空壳归还
+        void release_unrun(node_t* n) noexcept {
+            n->body.reset();
+            release_node(n);
         }
 
         void spawn_workers() {
@@ -1356,9 +1467,32 @@ namespace huxint::nexus {
                 return std::monostate{};
             }
         }
+
+        friend struct detail::pool_access;
     };
 
     /// 默认别名: 无特性的基础形态
     using pool = basic_pool<>;
+
+    namespace detail {
+        struct pool_access {
+            template <typename Pool, typename Rng, typename Make>
+            static std::expected<void, submit_error> execute_each(Pool& p, Rng&& rng, Make&& make) {
+                return p.execute_each(std::forward<Rng>(rng), std::forward<Make>(make));
+            }
+            template <typename Pool, typename Done, typename Block>
+            static void help_until(Pool& p, Done&& done, Block&& block) noexcept {
+                p.help_until(std::forward<Done>(done), std::forward<Block>(block));
+            }
+            template <typename Pool, typename Done>
+            static void sleep_until_bumped(const Pool& p, Done&& done) noexcept {
+                p.sleep_until_bumped(std::forward<Done>(done));
+            }
+            template <typename Pool>
+            static void bump(const Pool& p) noexcept {
+                p.bump_idle();
+            }
+        };
+    } // namespace detail
 
 } // namespace huxint::nexus

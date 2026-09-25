@@ -23,11 +23,11 @@
 import huxint.nexus;
 
 int main() {
-    huxint::nexus::basic_pool<decltype(huxint::nexus::priority)> p({.threads = 2});
+    huxint::nexus::basic_pool<huxint::nexus::priority> p({.threads = 2});
 
     // submit + 结果通道
     auto t = p.submit([](int x) { return x * 2; }, 21);
-    if (!t || t->get().value_or(0) != 42) {
+    if (t.get().value_or(0) != 42) {
         return 1;
     }
 
@@ -40,10 +40,7 @@ int main() {
     // 组合子: when_all + map
     auto a = p.submit([] { return 1; });
     auto b = p.submit([] { return 2; });
-    if (!a || !b) {
-        return 1;
-    }
-    auto sum = huxint::nexus::when_all(std::move(*a), std::move(*b)).map([](auto&& tup) {
+    auto sum = huxint::nexus::when_all(std::move(a), std::move(b)).map([](auto&& tup) {
         return std::get<0>(tup) + std::get<1>(tup);
     });
 

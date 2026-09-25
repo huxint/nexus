@@ -2,6 +2,7 @@
 #include <nexus/nexus.hpp>
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -203,9 +204,9 @@ TEST_SUITE("huxint::nexus.parallel") {
     TEST_CASE("parallel_for_side_effects") {
         pool p({.threads = 4});
         std::atomic<long> sum{0};
-        auto v = parallel_for(p, std::views::iota(1, 1001),
+        auto r = parallel_for(p, std::views::iota(1, 1001),
                               [&sum](int x) { sum.fetch_add(x, std::memory_order_relaxed); });
-        CHECK(v.run().has_value());
+        CHECK(r.has_value());
         CHECK(sum.load() == 500500L);
     }
 
@@ -213,9 +214,9 @@ TEST_SUITE("huxint::nexus.parallel") {
         pool p({.threads = 4});
         constexpr std::size_t n = 500;
         std::vector<int> out(n, 0);
-        auto v = parallel_for(p, std::views::iota(std::size_t{0}, n),
+        auto r = parallel_for(p, std::views::iota(std::size_t{0}, n),
                               [&out](std::size_t i) { out[i] = static_cast<int>(i) * 2; });
-        CHECK(v.run().has_value());
+        CHECK(r.has_value());
 
         bool ok = true;
         for (std::size_t i = 0; i < n; ++i) {
@@ -224,16 +225,83 @@ TEST_SUITE("huxint::nexus.parallel") {
         CHECK(ok);
     }
 
-    TEST_CASE("parallel_for_iteration_yields_void_expected") {
+    // 左值区间按指针携带: f 原地改写底层容器
+    TEST_CASE("parallel_for_mutates_lvalue_range_in_place") {
         pool p({.threads = 4});
-        std::vector<int> data(10, 1);
-        auto v = parallel_for(p, data, [](int&) {});
+        std::vector<int> data(64, 1);
+        CHECK(parallel_for(p, data, [](int& x) { x += 1; }).has_value());
+        CHECK(std::ranges::all_of(data, [](int x) { return x == 2; }));
+    }
 
-        std::size_t ok = 0;
-        for (auto&& r : v) {
-            ok += r.has_value() ? 1u : 0u;
+    TEST_CASE("parallel_for_returns_first_error") {
+        pool p({.threads = 4});
+        std::atomic<int> ran{0};
+        auto r = parallel_for(p, std::views::iota(0, 50), [&ran](int x) {
+            ran.fetch_add(1, std::memory_order_relaxed);
+            if (x == 13) {
+                throw std::runtime_error("thirteen");
+            }
+        });
+        REQUIRE(!r.has_value());
+        CHECK(ran.load() == 50); // 单个元素失败不影响其余元素
+
+        std::string what;
+        try {
+            std::rethrow_exception(r.error());
+        } catch (const std::runtime_error& e) {
+            what = e.what();
+        } catch (...) {
         }
-        CHECK(ok == std::size_t{10});
+        CHECK(what == std::string("thirteen"));
+    }
+
+    TEST_CASE("parallel_for_empty_range") {
+        pool p({.threads = 2});
+        std::vector<int> empty;
+        CHECK(parallel_for(p, empty, [](int) {}).has_value());
+    }
+
+    TEST_CASE("parallel_for_on_stopped_pool") {
+        pool p({.threads = 2});
+        p.shutdown();
+        std::atomic<int> ran{0};
+        auto r = parallel_for(p, std::views::iota(0, 5),
+                              [&ran](int) { ran.fetch_add(1, std::memory_order_relaxed); });
+        REQUIRE(!r.has_value());
+        CHECK(submit_error_of(r.error()) == submit_error::stopped);
+        CHECK(ran.load() == 0);
+    }
+
+    // 嵌套汇合: 外层元素占满全部 worker 后, 内层批量只能靠等待方帮忙执行.
+    // 阻塞式等待在此死锁
+    TEST_CASE("nested_parallel_for_saturating_workers") {
+        pool p({.threads = 2});
+        std::atomic<int> leaves{0};
+        auto r = parallel_for(p, std::views::iota(0, 8), [&](int) {
+            auto inner = parallel_for(p, std::views::iota(0, 64), [&](int) {
+                leaves.fetch_add(1, std::memory_order_relaxed);
+            });
+            if (!inner) {
+                std::rethrow_exception(inner.error());
+            }
+        });
+        CHECK(r.has_value());
+        CHECK(leaves.load() == 8 * 64);
+    }
+
+    TEST_CASE("nested_parallel_map_saturating_workers") {
+        pool p({.threads = 2});
+        auto r = parallel_for(p, std::views::iota(0, 8), [&](int) {
+            auto inner = parallel_map(p, std::views::iota(0, 16), [](int x) { return x; });
+            long sum = 0;
+            for (auto&& e : inner) {
+                sum += e.value_or(0);
+            }
+            if (sum != 120) {
+                throw std::runtime_error("bad sum");
+            }
+        });
+        CHECK(r.has_value());
     }
 
     // 错误通道
@@ -297,22 +365,21 @@ TEST_SUITE("huxint::nexus.parallel") {
         CHECK(v.run().has_value());
     }
 
-    // 池已关闭 => 每个元素的提交都失败, 错误经 submit_error_of 可还原
+    // 池已关闭 => 整批提交被拒, 以一个整批错误元素体现, 错误经 submit_error_of 可还原
     TEST_CASE("submit_failure_on_stopped_pool") {
         pool p({.threads = 2});
         p.shutdown();
         std::vector<int> data(5, 1);
         auto v = parallel_map(p, data, [](int x) { return x; });
 
-        std::size_t stopped = 0;
+        std::size_t n = 0;
         for (auto&& r : v) {
+            ++n;
             REQUIRE(!r.has_value());
-            auto se = submit_error_of(r.error());
-            if (se && *se == submit_error::stopped) {
-                ++stopped;
-            }
+            CHECK(submit_error_of(r.error()) == submit_error::stopped);
         }
-        CHECK(stopped == std::size_t{5});
+        CHECK(n == std::size_t{1});
+        CHECK(submit_error_of(v.batch_error()) == submit_error::stopped);
     }
 
     // 提交失败(池已关)不计入 submitted: 它统计的是真正入队的任务数
@@ -420,7 +487,7 @@ TEST_SUITE("huxint::nexus.parallel") {
     }
 
     TEST_CASE("works_with_flagged_pool") {
-        basic_pool<decltype(priority), decltype(trace)> p({.threads = 4});
+        basic_pool<priority, trace> p({.threads = 4});
         std::vector<int> data(40, 3);
         auto v = parallel_map(p, data, [](int x) { return x + 1; });
 
@@ -443,8 +510,7 @@ TEST_SUITE("huxint::nexus.parallel") {
             }
             return s;
         });
-        REQUIRE(outer.has_value());
-        CHECK(outer->get().value_or(-1) == 500L);
+        CHECK(outer.get().value_or(-1) == 500L);
     }
 
     TEST_CASE("partially_iterated_view_destroys_remaining_results") {
@@ -518,7 +584,7 @@ TEST_SUITE("huxint::nexus.parallel") {
         std::iota(data.begin(), data.end(), 0);
 
         std::atomic<int> bad_blocks{0};
-        auto v = parallel_for_chunked(
+        auto r = parallel_for_chunked(
             p, data,
             [&](auto&& c) {
                 int prev = *c.begin() - 1;
@@ -532,7 +598,7 @@ TEST_SUITE("huxint::nexus.parallel") {
             },
             10);
 
-        CHECK(v.run().has_value());
+        CHECK(r.has_value());
         CHECK(bad_blocks.load() == 0);
     }
 
@@ -632,7 +698,7 @@ TEST_SUITE("huxint::nexus.parallel") {
         std::vector<int> data(50, 1);
 
         {
-            auto v = parallel_for_chunked(
+            auto v = parallel_map_chunked(
                 p, data, [&calls](auto&&) { calls.fetch_add(1, std::memory_order_relaxed); }, 5);
             CHECK(v.submitted() == std::size_t{0});
         }

@@ -42,12 +42,12 @@ namespace tu {
         template <typename Pool>
         void block_all(Pool& p, std::size_t workers) {
             for (std::size_t i = 0; i < workers; ++i) {
-                static_cast<void>(p.execute([this]() noexcept {
+                p.execute([this]() noexcept {
                     arrived.fetch_add(1, std::memory_order_acq_rel);
                     while (!open.load(std::memory_order_acquire)) {
                         std::this_thread::yield();
                     }
-                }));
+                });
             }
             while (arrived.load(std::memory_order_acquire) < workers) {
                 std::this_thread::yield();

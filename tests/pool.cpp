@@ -35,37 +35,31 @@ TEST_SUITE("huxint.nexus") {
         auto b = p.submit([](int x, int y) { return x * y; }, 6, 7);
         auto c = p.submit([](std::string s) { return s + "!"; }, std::string("hi"));
 
-        REQUIRE(a.has_value());
-        REQUIRE(b.has_value());
-        REQUIRE(c.has_value());
-        CHECK(a->get().value_or(-1) == 42);
-        CHECK(b->get().value_or(-1) == 42);
-        CHECK(c->get().value_or(std::string{}) == std::string("hi!"));
+        CHECK(a.get().value_or(-1) == 42);
+        CHECK(b.get().value_or(-1) == 42);
+        CHECK(c.get().value_or(std::string{}) == std::string("hi!"));
     }
 
     TEST_CASE("submit_void_task") {
         pool p({.threads = 2});
         std::atomic<int> hits{0};
         auto t = p.submit([&hits] { hits.fetch_add(1, std::memory_order_relaxed); });
-        REQUIRE(t.has_value());
-        CHECK(t->get().has_value());
+        CHECK(t.get().has_value());
         CHECK(hits.load() == 1);
     }
 
     TEST_CASE("submit_result_consumed_once") {
         pool p({.threads = 2});
         auto t = p.submit([] { return std::string("once"); });
-        REQUIRE(t.has_value());
-        CHECK(t->get().value_or(std::string{}) == std::string("once"));
-        CHECK(!t->get().has_value()); // 二次取值落入错误通道
+        CHECK(t.get().value_or(std::string{}) == std::string("once"));
+        CHECK(!t.get().has_value()); // 二次取值落入错误通道
     }
 
     TEST_CASE("submit_accepts_move_only_callable") {
         pool p({.threads = 2});
         auto payload = std::make_unique<int>(41);
         auto t = p.submit([v = std::move(payload)] { return *v + 1; });
-        REQUIRE(t.has_value());
-        CHECK(t->get().value_or(-1) == 42);
+        CHECK(t.get().value_or(-1) == 42);
     }
 
     TEST_CASE("submit_each_maps_elements_and_batches_wake") {
@@ -154,9 +148,8 @@ TEST_SUITE("huxint.nexus") {
     TEST_CASE("task_exception_flows_to_error_channel") {
         pool p({.threads = 2});
         auto t = p.submit([]() -> int { throw std::runtime_error("boom"); });
-        REQUIRE(t.has_value());
 
-        auto r = t->get();
+        auto r = t.get();
         REQUIRE(!r.has_value());
         CHECK(r.error() != nullptr);
         CHECK(!is_cancelled(r.error())); // 是失败, 不是取消
@@ -175,12 +168,10 @@ TEST_SUITE("huxint.nexus") {
         pool p({.threads = 2});
         for (int i = 0; i < 20; ++i) {
             auto bad = p.submit([]() -> int { throw std::runtime_error("x"); });
-            REQUIRE(bad.has_value());
-            CHECK(!bad->get().has_value());
+            CHECK(!bad.get().has_value());
         }
         auto good = p.submit([] { return 9; });
-        REQUIRE(good.has_value());
-        CHECK(good->get().value_or(-1) == 9);
+        CHECK(good.get().value_or(-1) == 9);
     }
 
     TEST_CASE("submit_to_stopped_pool_returns_stopped") {
@@ -188,9 +179,9 @@ TEST_SUITE("huxint.nexus") {
         p.shutdown();
         CHECK(!p.running());
 
-        auto t = p.submit([] { return 1; });
-        REQUIRE(!t.has_value());
-        CHECK(t.error() == submit_error::stopped);
+        auto r = p.submit([] { return 1; }).get(); // 提交失败折入结果通道
+        REQUIRE(!r.has_value());
+        CHECK(submit_error_of(r.error()) == submit_error::stopped);
 
         auto e = p.execute([]() noexcept {});
         REQUIRE(!e.has_value());
@@ -200,9 +191,7 @@ TEST_SUITE("huxint.nexus") {
     TEST_CASE("try_create_nothrow_entry") {
         auto p = pool::try_create({.threads = 2});
         REQUIRE(p.has_value());
-        auto t = (*p)->submit([] { return 5; });
-        REQUIRE(t.has_value());
-        CHECK(t->get().value_or(-1) == 5);
+        CHECK((*p)->submit([] { return 5; }).get().value_or(-1) == 5);
     }
 
     // 生命周期
@@ -212,8 +201,7 @@ TEST_SUITE("huxint.nexus") {
         {
             pool p({.threads = 4});
             for (int i = 0; i < 2000; ++i) {
-                static_cast<void>(
-                    p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
+                p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); });
             }
         } // 析构 -> shutdown(drain)
         CHECK(ran.load() == 2000);
@@ -223,8 +211,7 @@ TEST_SUITE("huxint.nexus") {
         std::atomic<int> ran{0};
         pool p({.threads = 3});
         for (int i = 0; i < 1000; ++i) {
-            static_cast<void>(
-                p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
+            p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); });
         }
         p.shutdown(shutdown_policy::drain);
         CHECK(ran.load() == 1000);
@@ -237,16 +224,14 @@ TEST_SUITE("huxint.nexus") {
         g.block_all(p, 1);
 
         for (int i = 0; i < 500; ++i) {
-            static_cast<void>(
-                p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
+            p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); });
         }
         // 观察者排在 500 个任务之后: 丢弃按入队序进行, 它被取消终结之时整批已被丢弃
         auto observer = p.submit([] { return 0; });
-        REQUIRE(observer.has_value());
 
         // discard 不等待排空, 但 join worker 前须先放行闸门
         std::jthread dropper([&p] { p.shutdown(shutdown_policy::discard); });
-        auto r = observer->get();
+        auto r = observer.get();
         g.release();
         dropper.join();
 
@@ -264,10 +249,9 @@ TEST_SUITE("huxint.nexus") {
         g.block_all(p, 1);
 
         auto submitted = p.submit([] { return 7; });
-        REQUIRE(submitted.has_value());
 
         std::jthread dropper([&] { p.shutdown(shutdown_policy::discard); });
-        auto r = submitted->get(); // 阻塞至丢弃终结发布完成
+        auto r = submitted.get(); // 阻塞至丢弃终结发布完成
         g.release();               // 放行占位任务, 收敛循环方可在 pending 归零后结束
         dropper.join();
 
@@ -284,27 +268,24 @@ TEST_SUITE("huxint.nexus") {
         // submit 型任务: 节点带 discard 钩子, 指向其共享状态
         {
             auto t = p.submit([] { return std::string("payload"); });
-            REQUIRE(t.has_value());
-            CHECK(t->get().value_or(std::string{}) == std::string("payload"));
+            CHECK(t.get().value_or(std::string{}) == std::string("payload"));
         } // 句柄销毁 -> 共享状态释放; 节点回到 worker0 的空闲链
 
         std::atomic<bool> queued{false};
         std::atomic<bool> release{false};
         std::optional<task<int>> probe;
-        static_cast<void>(p.execute([&]() noexcept {
+        p.execute([&]() noexcept {
             // 在 worker 线程上嵌套提交 -> 取回上面那个节点
             for (int i = 0; i < 8; ++i) {
-                static_cast<void>(p.execute([]() noexcept {}));
+                p.execute([]() noexcept {});
             }
             // 探针排在最后: 丢弃按入队序进行, 它被取消终结之时复用节点已全部被丢弃
-            if (auto t = p.submit([] { return 0; })) {
-                probe.emplace(std::move(*t));
-            }
+            probe.emplace(p.submit([] { return 0; }));
             queued.store(true, std::memory_order_release);
             while (!release.load(std::memory_order_acquire)) {
                 std::this_thread::yield(); // 卡住唯一 worker, 嵌套任务滞留队列
             }
-        }));
+        });
 
         while (!queued.load(std::memory_order_acquire)) {
         }
@@ -332,24 +313,23 @@ TEST_SUITE("huxint.nexus") {
         pool p({.threads = 2});
         throwing_copy t{7};
         for (int i = 0; i < 1000; ++i) {
-            auto r = p.submit([](throwing_copy x) { return x.v; }, t); // 拷贝构造必抛
-            CHECK(!r.has_value());
-            CHECK(r.error() == submit_error::out_of_memory);
+            auto r = p.submit([](throwing_copy x) { return x.v; }, t).get(); // 拷贝构造必抛
+            REQUIRE(!r.has_value());
+            CHECK(submit_error_of(r.error()) == submit_error::out_of_memory);
         }
         // 失败不得损坏后续提交路径: 池继续正常执行并完成
         {
             auto ok = p.submit([] { return 41; });
-            REQUIRE(ok.has_value());
-            CHECK(ok->get().value_or(0) == 41);
+            CHECK(ok.get().value_or(0) == 41);
         }
-        static_cast<void>(p.execute([]() noexcept {}));
+        p.execute([]() noexcept {});
         p.wait();
         CHECK(p.running());
     }
 
     TEST_CASE("shutdown_idempotent") {
         pool p({.threads = 2});
-        static_cast<void>(p.execute([]() noexcept {}));
+        p.execute([]() noexcept {});
         p.shutdown();
         p.shutdown(shutdown_policy::discard);
         p.shutdown(shutdown_policy::drain);
@@ -366,7 +346,7 @@ TEST_SUITE("huxint.nexus") {
 
             std::jthread submitter([&] {
                 while (!stop_submitter.load(std::memory_order_acquire)) {
-                    static_cast<void>(p.execute([]() noexcept {}));
+                    p.execute([]() noexcept {});
                 }
             });
 
@@ -410,7 +390,7 @@ TEST_SUITE("huxint.nexus") {
                     while (!go.load(std::memory_order_acquire)) {
                     }
                     for (int k = 0; k < 256; ++k) {
-                        static_cast<void>(p.execute([]() noexcept {}));
+                        p.execute([]() noexcept {});
                     }
                 });
             }
@@ -435,7 +415,7 @@ TEST_SUITE("huxint.nexus") {
         std::atomic<bool> stop{false};
         std::jthread prod([&] {
             while (!stop.load(std::memory_order_acquire)) {
-                static_cast<void>(p.execute([]() noexcept {})); // 被拒也继续重试
+                p.execute([]() noexcept {}); // 被拒也继续重试
             }
         });
         std::this_thread::sleep_for(2ms); // 让重试流稳定运转
@@ -490,11 +470,7 @@ TEST_SUITE("huxint.nexus") {
                 return;
             }
             while (!finish.load(std::memory_order_acquire)) {
-                auto child = p.submit([&] { children.fetch_add(1, std::memory_order_release); });
-                if (!child) {
-                    std::abort();
-                }
-                child->wait();
+                p.submit([&] { children.fetch_add(1, std::memory_order_release); }).wait();
             }
         });
         REQUIRE(parents.has_value());
@@ -594,7 +570,7 @@ TEST_SUITE("huxint.nexus") {
     // 优先级
 
     TEST_CASE("priority_single_worker_high_first") {
-        basic_pool<decltype(priority)> p({.threads = 1});
+        basic_pool<priority> p({.threads = 1});
         tu::gate g;
         g.block_all(p, 1);
 
@@ -605,9 +581,9 @@ TEST_SUITE("huxint.nexus") {
             order.push_back(tag);
         };
 
-        static_cast<void>(p.execute(task_priority::low, [&record]() noexcept { record(0); }));
-        static_cast<void>(p.execute(task_priority::normal, [&record]() noexcept { record(1); }));
-        static_cast<void>(p.execute(task_priority::high, [&record]() noexcept { record(2); }));
+        p.execute(task_priority::low, [&record]() noexcept { record(0); });
+        p.execute(task_priority::normal, [&record]() noexcept { record(1); });
+        p.execute(task_priority::high, [&record]() noexcept { record(2); });
 
         g.release();
         p.wait();
@@ -617,10 +593,9 @@ TEST_SUITE("huxint.nexus") {
     }
 
     TEST_CASE("priority_submit_accepts_level") {
-        basic_pool<decltype(priority)> p({.threads = 2});
+        basic_pool<priority> p({.threads = 2});
         auto t = p.submit(task_priority::high, [](int v) { return v + 1; }, 10);
-        REQUIRE(t.has_value());
-        CHECK(t->get().value_or(-1) == 11);
+        CHECK(t.get().value_or(-1) == 11);
     }
 
     // 取消
@@ -635,11 +610,10 @@ TEST_SUITE("huxint.nexus") {
             body_ran.fetch_add(1, std::memory_order_relaxed);
             return 7;
         });
-        REQUIRE(t.has_value());
-        t->request_stop(); // 尚在排队
+        t.request_stop(); // 尚在排队
         g.release();
 
-        auto r = t->get();
+        auto r = t.get();
         REQUIRE(!r.has_value());
         CHECK(is_cancelled(r.error()));
         CHECK(body_ran.load() == 0); // 任务体从未执行
@@ -657,16 +631,15 @@ TEST_SUITE("huxint.nexus") {
             }
             return spins;
         });
-        REQUIRE(t.has_value());
         while (!started.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
-        t->request_stop();
-        CHECK(t->get().has_value()); // 协作退出属正常完成
+        t.request_stop();
+        CHECK(t.get().has_value()); // 协作退出属正常完成
     }
 
     TEST_CASE("cancellable_execute_returns_stop_source") {
-        basic_pool<decltype(cancellable)> p({.threads = 2});
+        basic_pool<cancellable> p({.threads = 2});
         std::atomic<bool> started{false};
         std::atomic<bool> observed_stop{false};
         auto src = p.execute([&started, &observed_stop](std::stop_token tok) noexcept {
@@ -688,7 +661,7 @@ TEST_SUITE("huxint.nexus") {
     // 回归: 泛型 callable 对普通/可取消两条 execute 路径皆可行(须消歧).
     // 消歧规则: 无 token 也可调用的归普通重载; 必须 token 的归可取消重载
     TEST_CASE("execute_overload_disambiguation_on_generic_callable") {
-        basic_pool<decltype(cancellable)> p({.threads = 1});
+        basic_pool<cancellable> p({.threads = 1});
 
         // [](auto&&...) 无 token 也可调用 -> 普通重载, 返回 void 通道
         auto plain = p.execute([](auto&&...) noexcept {});
@@ -714,8 +687,7 @@ TEST_SUITE("huxint.nexus") {
     TEST_CASE("uncancelled_token_task_completes_normally") {
         pool p({.threads = 2});
         auto t = p.submit([](std::stop_token tok) { return tok.stop_requested() ? -1 : 123; });
-        REQUIRE(t.has_value());
-        CHECK(t->get().value_or(-1) == 123);
+        CHECK(t.get().value_or(-1) == 123);
     }
 
     // trace 钩子
@@ -740,10 +712,9 @@ TEST_SUITE("huxint.nexus") {
         hooks.on_end = sink;
 
         {
-            basic_pool<decltype(trace)> p({.threads = 2, .hooks = std::move(hooks)});
+            basic_pool<trace> p({.threads = 2, .hooks = std::move(hooks)});
             auto t = p.submit([] { return 1; });
-            REQUIRE(t.has_value());
-            CHECK(t->get().value_or(-1) == 1);
+            CHECK(t.get().value_or(-1) == 1);
             p.wait();
         }
 
@@ -789,12 +760,12 @@ TEST_SUITE("huxint.nexus") {
             inverted += enqueued[e.id] == 0;
         };
         {
-            basic_pool<decltype(trace)> p({.threads = 4, .hooks = std::move(hooks)});
+            basic_pool<trace> p({.threads = 4, .hooks = std::move(hooks)});
             for (std::uint64_t i = 0; i + 1 < n; ++i) {
                 REQUIRE(p.execute([]() noexcept {}).has_value());
             }
             REQUIRE(p.execute([&p]() noexcept {
-                         static_cast<void>(p.execute([]() noexcept {}));
+                         p.execute([]() noexcept {});
                      }).has_value());
             p.wait();
         }
@@ -811,15 +782,14 @@ TEST_SUITE("huxint.nexus") {
             ends.push_back(e.outcome);
         };
 
-        basic_pool<decltype(trace)> p({.threads = 1, .hooks = std::move(hooks)});
+        basic_pool<trace> p({.threads = 1, .hooks = std::move(hooks)});
         tu::gate g;
         g.block_all(p, 1);
 
         auto t = p.submit([](std::stop_token) { return 1; });
-        REQUIRE(t.has_value());
-        t->request_stop();
+        t.request_stop();
         g.release();
-        static_cast<void>(t->get());
+        static_cast<void>(t.get());
         p.wait();
 
         std::scoped_lock lk(m);
@@ -839,10 +809,9 @@ TEST_SUITE("huxint.nexus") {
             ends.push_back(e.outcome);
         };
 
-        basic_pool<decltype(trace)> p({.threads = 2, .hooks = std::move(hooks)});
+        basic_pool<trace> p({.threads = 2, .hooks = std::move(hooks)});
         auto t = p.submit([]() -> int { throw std::runtime_error("x"); });
-        REQUIRE(t.has_value());
-        static_cast<void>(t->get());
+        static_cast<void>(t.get());
         p.wait();
 
         std::scoped_lock lk(m);
@@ -856,27 +825,25 @@ TEST_SUITE("huxint.nexus") {
     // 特性标签组合
 
     TEST_CASE("worker_cap_static_storage_clamps_threads") {
-        basic_pool<decltype(worker_cap<1>)> p; // threads = 0 -> hardware_concurrency, 收紧到 1
+        basic_pool<worker_cap<1>> p; // threads = 0 -> hardware_concurrency, 收紧到 1
         CHECK(p.thread_count() == std::size_t{1});
 
         std::atomic<int> n{0};
         for (int i = 0; i < 100; ++i) {
-            static_cast<void>(
-                p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); }));
+            p.execute([&n]() noexcept { n.fetch_add(1, std::memory_order_relaxed); });
         }
         p.wait();
         CHECK(n.load() == 100);
     }
 
     TEST_CASE("all_flags_combined") {
-        basic_pool<decltype(priority), decltype(cancellable), decltype(trace),
-                   decltype(worker_cap<8>)>
+        basic_pool<priority, cancellable, trace,
+                   worker_cap<8>>
             p({.threads = 3});
         CHECK(p.thread_count() == std::size_t{3});
 
         auto t = p.submit(task_priority::high, [] { return 77; });
-        REQUIRE(t.has_value());
-        CHECK(t->get().value_or(-1) == 77);
+        CHECK(t.get().value_or(-1) == 77);
     }
 
     // 工作窃取与压力
@@ -888,12 +855,12 @@ TEST_SUITE("huxint.nexus") {
         constexpr int inner = 64;
 
         for (int i = 0; i < outer; ++i) {
-            static_cast<void>(p.execute([&p, &total]() noexcept {
+            p.execute([&p, &total]() noexcept {
                 for (int j = 0; j < inner; ++j) {
                     static_cast<void>(p.execute(
                         [&total]() noexcept { total.fetch_add(1, std::memory_order_relaxed); }));
                 }
-            }));
+            });
         }
         p.wait();
         CHECK(total.load() == outer * inner);
@@ -910,8 +877,7 @@ TEST_SUITE("huxint.nexus") {
                     return;
                 }
                 for (int i = 0; i < 2; ++i) {
-                    static_cast<void>(
-                        p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); }));
+                    p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); });
                 }
             }
         };
@@ -930,8 +896,8 @@ TEST_SUITE("huxint.nexus") {
         for (int t = 0; t < producers; ++t) {
             ts.emplace_back([&p, &total] {
                 for (int i = 0; i < each; ++i) {
-                    static_cast<void>(p.execute(
-                        [&total]() noexcept { total.fetch_add(1, std::memory_order_relaxed); }));
+                    p.execute(
+                        [&total]() noexcept { total.fetch_add(1, std::memory_order_relaxed); });
                 }
             });
         }
@@ -1000,7 +966,7 @@ TEST_SUITE("huxint.nexus") {
     static_assert(valid_worker_cap<1> && !valid_worker_cap<0>);
 
     TEST_CASE("queue_cap_tiny_capacities_no_loss") {
-        basic_pool<decltype(queue_cap<8, 2>)> p({.threads = 2});
+        basic_pool<queue_cap<8, 2>> p({.threads = 2});
         constexpr int n = 5000;
         tu::gate g;
         g.block_all(p, 2);
@@ -1024,17 +990,17 @@ TEST_SUITE("huxint.nexus") {
 
     // 本地 deque 容量 2: worker 内嵌套提交溢出本地后落入全局, 不丢不拒
     TEST_CASE("queue_cap_local_overflow_falls_to_global") {
-        basic_pool<decltype(queue_cap<1024, 2>)> p({.threads = 1});
+        basic_pool<queue_cap<1024, 2>> p({.threads = 1});
         std::atomic<int> done{0};
         constexpr int children = 100;
-        static_cast<void>(p.execute([&p, &done]() noexcept {
+        p.execute([&p, &done]() noexcept {
             // 父任务独占唯一 worker, 100 个子任务无人消费 -> 本地 2 槽必然溢出
             for (int i = 0; i < children; ++i) {
                 static_cast<void>(p.execute([&done]() noexcept {
                     done.fetch_add(1, std::memory_order_relaxed);
                 }));
             }
-        }));
+        });
         p.wait();
         CHECK(done.load() == children);
     }
@@ -1045,9 +1011,9 @@ TEST_SUITE("huxint.nexus") {
         constexpr int n = 2000;
         std::atomic<int> done{0};
         for (int i = 0; i < n; ++i) {
-            static_cast<void>(p.execute([&done]() noexcept {
+            p.execute([&done]() noexcept {
                 done.fetch_add(1, std::memory_order_relaxed);
-            }));
+            });
         }
         p.wait();
         CHECK(done.load() == n);
@@ -1058,9 +1024,9 @@ TEST_SUITE("huxint.nexus") {
         pool p({.threads = 2, .spin_budget = 5ms});
         std::atomic<int> done{0};
         for (int i = 0; i < 100; ++i) {
-            static_cast<void>(p.execute([&done]() noexcept {
+            p.execute([&done]() noexcept {
                 done.fetch_add(1, std::memory_order_relaxed);
-            }));
+            });
         }
         p.wait();
         CHECK(done.load() == 100);
@@ -1074,9 +1040,9 @@ TEST_SUITE("huxint.nexus") {
             pool p({.threads = 2, .spin_budget = budget});
             std::atomic<int> done{0};
             for (int i = 0; i < n; ++i) {
-                static_cast<void>(p.execute([&done]() noexcept {
+                p.execute([&done]() noexcept {
                     done.fetch_add(1, std::memory_order_relaxed);
-                }));
+                });
                 if (i + 1 != n) {
                     std::this_thread::sleep_for(200us); // 长于预算: 提交前必已入睡
                 }
@@ -1127,10 +1093,8 @@ TEST_SUITE("huxint.nexus") {
                     leaves.fetch_add(1, std::memory_order_relaxed);
                     return;
                 }
-                static_cast<void>(
-                    p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); }));
-                static_cast<void>(
-                    p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); }));
+                p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); });
+                p.execute([&p, depth, &leaves]() noexcept { go(p, depth - 1, leaves); });
             }
         };
         fork::go(p, 10, leaves); // 根任务排队(未运行), 共 2^10 = 1024 叶
@@ -1153,10 +1117,10 @@ TEST_SUITE("huxint.nexus") {
 
         std::atomic<bool> nested_ok{false};
         // root 排在闸门之后: 运行时池已处于 stopping 状态
-        static_cast<void>(p.execute([&p, &nested_ok]() noexcept {
+        p.execute([&p, &nested_ok]() noexcept {
             nested_ok.store(p.execute([]() noexcept {}).has_value(),
                             std::memory_order_relaxed);
-        }));
+        });
 
         std::jthread shut([&p] { p.shutdown(shutdown_policy::drain); });
         while (p.running()) { // 等到 stopping_ 置位, 此时 root 仍被闸门挡着
@@ -1172,8 +1136,7 @@ TEST_SUITE("huxint.nexus") {
         pool p({.threads = 1});
         std::vector<int> order;
         for (int i = 0; i < 100; ++i) {
-            static_cast<void>(
-                p.execute([&order, i]() noexcept { order.push_back(i); })); // 单 worker 免锁
+            p.execute([&order, i]() noexcept { order.push_back(i); }); // 单 worker 免锁
         }
         p.wait();
 
@@ -1247,9 +1210,8 @@ TEST_SUITE("huxint.nexus") {
                 return;
             }
             const std::size_t mid = lo + (hi - lo) / 2;
-            static_cast<void>(
-                p.fork_join([&, lo, mid]() noexcept { self(self, lo, mid); },
-                            [&, lo = mid, mid = hi]() noexcept { self(self, lo, mid); }));
+            p.fork_join([&, lo, mid]() noexcept { self(self, lo, mid); },
+                            [&, lo = mid, mid = hi]() noexcept { self(self, lo, mid); });
         };
         go(go, 0, n);
         p.wait();
@@ -1260,8 +1222,8 @@ TEST_SUITE("huxint.nexus") {
         pool p({.threads = 2});
         std::atomic<bool> submitted_ran{false};
         std::thread::id inline_id{};
-        static_cast<void>(p.fork_join([&]() noexcept { submitted_ran.store(true); },
-                                      [&] { inline_id = std::this_thread::get_id(); }));
+        p.fork_join([&]() noexcept { submitted_ran.store(true); },
+                                      [&] { inline_id = std::this_thread::get_id(); });
         CHECK(inline_id == std::this_thread::get_id());
         p.wait();
         CHECK(submitted_ran.load());
@@ -1271,9 +1233,9 @@ TEST_SUITE("huxint.nexus") {
     TEST_CASE("fork_join_inline_branch_exception_propagates_unchanged") {
         pool p({.threads = 2});
         std::atomic<bool> forked{false};
-        CHECK_THROWS_AS(static_cast<void>(p.fork_join(
+        CHECK_THROWS_AS(p.fork_join(
                             [&]() noexcept { forked.store(true, std::memory_order_relaxed); },
-                            [] { throw std::bad_alloc{}; })),
+                            [] { throw std::bad_alloc{}; }),
                         std::bad_alloc);
         p.wait();
         CHECK(forked.load());

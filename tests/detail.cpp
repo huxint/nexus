@@ -310,6 +310,38 @@ TEST_SUITE("huxint::nexus.detail") {
         CHECK(live.load() == 0);
     }
 
+    // consume = 调用 + 析构: 就地与堆存储两种模式都在调用后析构并置空
+    TEST_CASE("sbo_function_consume_invokes_then_destroys") {
+        struct tracker {
+            std::atomic<int>* live;
+            int* seen;
+            tracker(std::atomic<int>* c, int* s) : live(c), seen(s) { live->fetch_add(1); }
+            tracker(const tracker& o) : live(o.live), seen(o.seen) { live->fetch_add(1); }
+            ~tracker() { live->fetch_sub(1); }
+            void operator()(bool run) const noexcept { *seen = run ? 1 : 2; }
+        };
+        struct big_tracker : tracker {
+            using tracker::tracker;
+            std::array<char, 256> bulk{};
+        };
+
+        std::atomic<int> live{0};
+        int seen = 0;
+        sbo_function<64, void(bool)> small{tracker{&live, &seen}};
+        sbo_function<64, void(bool)> big{big_tracker{&live, &seen}};
+        CHECK(live.load() == 2);
+
+        small.consume(true);
+        CHECK(seen == 1);
+        CHECK(!small);
+        CHECK(live.load() == 1);
+
+        big.consume(false);
+        CHECK(seen == 2);
+        CHECK(!big);
+        CHECK(live.load() == 0);
+    }
+
     struct stub_node {
         stub_node* next = nullptr;
     };

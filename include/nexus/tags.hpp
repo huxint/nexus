@@ -62,10 +62,8 @@ namespace huxint::nexus {
     inline constexpr detail::queue_cap_flag<Global, Local> queue_cap{};
 
     namespace detail {
-        // 标签以 `inline constexpr` 声明 -> decltype(标签) 携带顶层 const,
-        // 以下所有判别均先剥离 cv 再比较, 避免 const 导致匹配失败
         template <typename Tag, typename... Flags>
-        inline constexpr bool has_flag_v = (std::same_as<std::remove_cv_t<Flags>, Tag> || ...);
+        inline constexpr bool has_flag_v = (std::same_as<Flags, Tag> || ...);
 
         /// 值标签的容量提取; 非该类标签取 0. 标签自身约束容量为正,
         /// 故 0 只可能表示"未提供"
@@ -84,28 +82,31 @@ namespace huxint::nexus {
         template <std::size_t G, std::size_t L>
         inline constexpr std::size_t local_cap_of<queue_cap_flag<G, L>> = L;
 
+        /// 可作池模板实参的特性标签: 非标签值(如 basic_pool<3>)在实例化处即被拒
+        template <typename T>
+        concept pool_flag = std::same_as<T, priority_flag> || std::same_as<T, cancellable_flag> ||
+                            std::same_as<T, trace_flag> || worker_cap_of<T> != 0 ||
+                            global_cap_of<T> != 0;
+
         /// 同类值标签的出现次数(池侧 static_assert 限定至多一份)
         template <typename... Flags>
-        inline constexpr std::size_t worker_cap_count_v =
-            (0uz + ... + (worker_cap_of<std::remove_cv_t<Flags>> != 0));
+        inline constexpr std::size_t worker_cap_count_v = (0uz + ... + (worker_cap_of<Flags> != 0));
         template <typename... Flags>
-        inline constexpr std::size_t queue_cap_count_v =
-            (0uz + ... + (global_cap_of<std::remove_cv_t<Flags>> != 0));
+        inline constexpr std::size_t queue_cap_count_v = (0uz + ... + (global_cap_of<Flags> != 0));
 
         /// 聚合提取容量: 0 = 动态存储(未提供 worker_cap)
         template <typename... Flags>
-        inline constexpr std::size_t worker_capacity_v =
-            std::max({worker_cap_of<std::remove_cv_t<Flags>>..., 0uz});
+        inline constexpr std::size_t worker_capacity_v = std::max({worker_cap_of<Flags>..., 0uz});
 
         /// 无 queue_cap 标签时折叠为 0, 替换为缺省值
         template <typename... Flags>
         inline constexpr std::size_t queue_global_cap_v = [] {
-            constexpr std::size_t v = std::max({global_cap_of<std::remove_cv_t<Flags>>..., 0uz});
+            constexpr std::size_t v = std::max({global_cap_of<Flags>..., 0uz});
             return v != 0 ? v : queue_cap_default_global;
         }();
         template <typename... Flags>
         inline constexpr std::size_t queue_local_cap_v = [] {
-            constexpr std::size_t v = std::max({local_cap_of<std::remove_cv_t<Flags>>..., 0uz});
+            constexpr std::size_t v = std::max({local_cap_of<Flags>..., 0uz});
             return v != 0 ? v : queue_cap_default_local;
         }();
     } // namespace detail

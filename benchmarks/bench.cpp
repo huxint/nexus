@@ -364,9 +364,7 @@ int main(int argc, char** argv) {
         const double ours = mops(count, best_pool_seconds(reps, make_ours, [&](auto& p) {
             long sum = 0;
             for (std::size_t i = 0; i < count; ++i) {
-                if (auto t = p.submit([] { return 1; })) {
-                    sum += t->get().value_or(0);
-                }
+                sum += p.submit([] { return 1; }).get().value_or(0);
             }
             if (sum != static_cast<long>(count)) {
                 std::println("!! huxint::nexus result verification failed");
@@ -457,9 +455,7 @@ int main(int argc, char** argv) {
         const latency bs = roundtrip(
             make_bs, [](auto& p) { static_cast<void>(p.submit_task([] { return 0; }).get()); });
         const latency ours = roundtrip(make_ours, [](auto& p) {
-            auto t = p.submit([] { return 0; });
-            require_success(t);
-            require_success(t->get());
+            require_success(p.submit([] { return 0; }).get());
         });
 
         std::println("{:<{}} {:>{}} {:>{}} {:>{}}", "quantile", NAME_W, "Taskflow", COL_W, "BS",
@@ -569,14 +565,14 @@ int main(int argc, char** argv) {
     {
         const std::size_t count = 500'000 / scale;
 
-        using prio_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::priority)>;
-        using cancel_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::cancellable)>;
-        using trace_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::trace)>;
-        using capped_pool = huxint::nexus::basic_pool<decltype(huxint::nexus::worker_cap<8>)>;
+        using prio_pool = huxint::nexus::basic_pool<huxint::nexus::priority>;
+        using cancel_pool = huxint::nexus::basic_pool<huxint::nexus::cancellable>;
+        using trace_pool = huxint::nexus::basic_pool<huxint::nexus::trace>;
+        using capped_pool = huxint::nexus::basic_pool<huxint::nexus::worker_cap<8>>;
         using all_pool =
-            huxint::nexus::basic_pool<decltype(huxint::nexus::priority),
-                                   decltype(huxint::nexus::cancellable), decltype(huxint::nexus::trace),
-                                   decltype(huxint::nexus::worker_cap<8>)>;
+            huxint::nexus::basic_pool<huxint::nexus::priority,
+                                   huxint::nexus::cancellable, huxint::nexus::trace,
+                                   huxint::nexus::worker_cap<8>>;
 
         // 各组合的测量闭包; 交错采样让它们在相近的系统状态下被测量
         const std::vector<std::pair<std::string_view, std::function<double(std::size_t)>>> combos =
@@ -755,7 +751,7 @@ int main(int argc, char** argv) {
                   1e3;
 #endif
             const double ours = best_pool_seconds(reps, make_ours, [&](auto& p) {
-                                    auto v = huxint::nexus::parallel_map_chunked(
+                                    require_success(huxint::nexus::parallel_for_chunked(
                                         p, data,
                                         [](auto&& chunk) {
                                             double acc = 0;
@@ -765,8 +761,7 @@ int main(int argc, char** argv) {
                                             volatile double sink = acc;
                                             static_cast<void>(sink);
                                         },
-                                        64);
-                                    require_success(v.run());
+                                        64));
                                 }) *
                                 1e3;
             const std::string ratio =

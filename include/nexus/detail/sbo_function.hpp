@@ -18,7 +18,16 @@ namespace huxint::nexus::detail {
     class sbo_function<SboBytes, R(Args...)> {
         struct vtable {
             R (*invoke)(std::byte* self, Args... args);
+            /// 调用后即析构: 执行一次即弃的宿主(任务节点)只付一次间接调用
+            R (*consume)(std::byte* self, Args... args);
             void (*destroy)(std::byte* self) noexcept;
+        };
+
+        /// consume 的析构守卫: 可调用体抛出时同样析构
+        template <typename FD>
+        struct destroy_on_exit {
+            FD* f;
+            ~destroy_on_exit() { std::destroy_at(f); }
         };
 
         /// 就地存储的准入: 尺寸与对齐都落在缓冲内
@@ -32,6 +41,10 @@ namespace huxint::nexus::detail {
                 [](std::byte* s, Args... args) -> R {
                     return (*std::launder(reinterpret_cast<FD*>(s)))(std::forward<Args>(args)...);
                 },
+                [](std::byte* s, Args... args) -> R {
+                    const destroy_on_exit<FD> guard{std::launder(reinterpret_cast<FD*>(s))};
+                    return (*guard.f)(std::forward<Args>(args)...);
+                },
                 [](std::byte* s) noexcept {
                     std::destroy_at(std::launder(reinterpret_cast<FD*>(s)));
                 },
@@ -44,6 +57,10 @@ namespace huxint::nexus::detail {
             static const vtable vt{
                 [](std::byte* s, Args... args) -> R {
                     return (**std::launder(reinterpret_cast<FD**>(s)))(std::forward<Args>(args)...);
+                },
+                [](std::byte* s, Args... args) -> R {
+                    const std::unique_ptr<FD> owned{*std::launder(reinterpret_cast<FD**>(s))};
+                    return (*owned)(std::forward<Args>(args)...);
                 },
                 [](std::byte* s) noexcept { delete *std::launder(reinterpret_cast<FD**>(s)); },
             };
@@ -94,6 +111,14 @@ namespace huxint::nexus::detail {
         }
 
         R operator()(Args... args) { return vt_->invoke(storage_, std::forward<Args>(args)...); }
+
+        /// 调用并析构可调用体, 之后为空. 等价于 operator() 接 reset(), 但只有
+        /// 一次间接调用. 可调用体抛出时同样析构并置空
+        /// @pre 非空
+        R consume(Args... args) {
+            const vtable* vt = std::exchange(vt_, nullptr);
+            return vt->consume(storage_, std::forward<Args>(args)...);
+        }
 
         void reset() noexcept {
             if (vt_) {

@@ -10,6 +10,7 @@
 #include <memory>
 #include <new>
 #include <optional>
+#include <ranges>
 #include <stop_token>
 #include <tuple>
 #include <type_traits>
@@ -22,6 +23,15 @@ namespace huxint::nexus {
     enum class submit_error : std::uint8_t {
         stopped,       ///< 池已关闭, 拒绝新任务
         out_of_memory, ///< 内部分配失败
+    };
+
+    /// 即发即忘提交(execute / fork_join)的结果: 接口即 std::expected<void, submit_error>,
+    /// 只是不强制检查 - 标准库把 expected 整个类型标成 [[nodiscard]], 而即发即忘
+    /// 的调用方通常不关心提交是否被拒
+    struct submit_status : std::expected<void, submit_error> {
+        using std::expected<void, submit_error>::expected;
+        submit_status(std::expected<void, submit_error> e) noexcept
+            : std::expected<void, submit_error>(e) {}
     };
 
     /// 被取消任务的错误标记(经 get() 的错误通道返回)
@@ -41,6 +51,15 @@ namespace huxint::nexus {
         const std::exception_ptr& shared_error() noexcept {
             static const std::exception_ptr e = std::make_exception_ptr(E{});
             return e;
+        }
+
+        /// submit_error 的共享错误指针: 提交失败折入结果通道时同样免去逐个分配
+        [[nodiscard]]
+        inline const std::exception_ptr& submit_error_ptr(submit_error e) noexcept {
+            static const std::exception_ptr stopped = std::make_exception_ptr(submit_error::stopped);
+            static const std::exception_ptr oom =
+                std::make_exception_ptr(submit_error::out_of_memory);
+            return e == submit_error::stopped ? stopped : oom;
         }
     } // namespace detail
 
@@ -308,6 +327,11 @@ namespace huxint::nexus {
                 if (waiters_.load(std::memory_order_acquire) != 0) [[unlikely]] {
                     done_.notify_all();
                 }
+                if (!list) {
+                    // 无续延(常态): 深度计数与待重放队列都无须触碰 - 待重放项
+                    // 只在续延帧内登记, 且由登记它的最外层帧负责排空
+                    return;
+                }
                 ++cont_depth; // 本帧的续延以内联深度计(见 cont_depth_limit)
                 while (list) {
                     cont_node* n = std::exchange(list, list->next);
@@ -366,6 +390,11 @@ namespace huxint::nexus {
             [[nodiscard]]
             std::exception_ptr raw_exception() const noexcept {
                 return exc_;
+            }
+
+            [[nodiscard]]
+            bool is_done() const noexcept {
+                return done_.load(std::memory_order_acquire) != 0;
             }
 
             void wait_done() const {
@@ -454,6 +483,35 @@ namespace huxint::nexus {
             }
         }
 
+        template <typename T>
+        concept tuple_like = requires { std::tuple_size<std::remove_cvref_t<T>>::value; };
+
+        template <typename F, typename Tup,
+                  typename = std::make_index_sequence<std::tuple_size_v<std::remove_cvref_t<Tup>>>>
+        inline constexpr bool applicable_v = false;
+        template <typename F, typename Tup, std::size_t... I>
+        inline constexpr bool applicable_v<F, Tup, std::index_sequence<I...>> =
+            std::invocable<F, decltype(std::get<I>(std::declval<Tup>()))...>;
+
+        /// f 能否以元组各元素为实参调用. std::apply 本身不对 SFINAE 友好, 故逐元素判定
+        template <typename F, typename Tup>
+        concept applicable = tuple_like<Tup> && applicable_v<F, Tup>;
+
+        /// 续延对值的调用: 值整体可作实参则直接调用; 否则值为元组时展开成多实参,
+        /// 使 when_all(a, b).map([](int x, int y) { ... }) 成立. 整值优先 -
+        /// 泛型的 [](auto&& tup) 照旧拿到整个元组. void 父任务无实参
+        template <typename F, typename... V>
+            requires(sizeof...(V) <= 1)
+        decltype(auto) invoke_value(F& f, V&&... v) {
+            if constexpr (std::invocable<F&, V&&...>) {
+                return std::invoke(f, std::forward<V>(v)...);
+            } else {
+                static_assert((applicable<F&, V&&> && ...),
+                              "continuation is not invocable with the value or its tuple elements");
+                return std::apply(f, std::forward<V>(v)...);
+            }
+        }
+
         /// task 内部状态的库内访问口: 组合子经此接线, st_ 对库外保持私有
         struct task_access {
             template <typename T>
@@ -478,9 +536,9 @@ namespace huxint::nexus {
                     parent,
                     [&](auto&&... v) {
                         if constexpr (std::is_void_v<U>) {
-                            std::invoke(fn, std::forward<decltype(v)>(v)...);
+                            invoke_value(fn, std::forward<decltype(v)>(v)...);
                         } else {
-                            dst->emplace_value(std::invoke(fn, std::forward<decltype(v)>(v)...));
+                            dst->emplace_value(invoke_value(fn, std::forward<decltype(v)>(v)...));
                         }
                     },
                     [&](std::exception_ptr e) { dst->set_exception(std::move(e)); });
@@ -497,7 +555,7 @@ namespace huxint::nexus {
                 deliver(
                     parent,
                     [&](auto&&... v) {
-                        std::invoke(fn, v...); // 旁观以左值交付, 值随后原样转入子状态
+                        invoke_value(fn, v...); // 旁观以左值交付, 值随后原样转入子状态
                         dst->emplace_value(std::move(v)...);
                     },
                     [&](std::exception_ptr e) { dst->set_exception(std::move(e)); });
@@ -539,7 +597,7 @@ namespace huxint::nexus {
                         parent,
                         [&](auto&&... v) {
                             inner = task_access::release(
-                                std::invoke(fn, std::forward<decltype(v)>(v)...));
+                                invoke_value(fn, std::forward<decltype(v)>(v)...));
                         },
                         fail)) {
                     return;
@@ -621,20 +679,111 @@ namespace huxint::nexus {
             }
         };
 
+        /// 区间汇合的结果类型: 值任务汇成 vector, void 任务汇成 void
+        template <typename T>
+        using when_all_range_t = std::conditional_t<std::is_void_v<T>, void, std::vector<T>>;
+
+        /// 区间版汇合核心: 与 when_all_core 同一协议, 槽位数在运行期确定
+        template <typename T>
+        class when_all_range_core {
+            using result_t = when_all_range_t<T>;
+
+        public:
+            when_all_range_core(std::shared_ptr<shared_state<result_t>> d, std::size_t n)
+                : dst_(std::move(d)), remaining_(n) {
+                if constexpr (!std::is_void_v<T>) {
+                    slots_ = std::make_unique<value_slot<T>[]>(n);
+                    size_ = n;
+                }
+            }
+
+            void record_error(std::exception_ptr e) noexcept {
+                if (!errored_.exchange(true, std::memory_order_relaxed)) {
+                    first_err_ = std::move(e);
+                }
+            }
+
+            template <typename V>
+            void put(std::size_t i, V&& v) noexcept(std::is_nothrow_move_constructible_v<V>) {
+                slots_[i].emplace(std::forward<V>(v));
+            }
+
+            void settle_one() noexcept {
+                if (remaining_.fetch_sub(1, std::memory_order_acq_rel) != 1) {
+                    return;
+                }
+                if (errored_.load(std::memory_order_relaxed)) {
+                    dst_->set_exception(std::move(first_err_));
+                } else {
+                    try {
+                        if constexpr (std::is_void_v<T>) {
+                            dst_->emplace_value();
+                        } else {
+                            std::vector<T> out;
+                            out.reserve(size_);
+                            for (std::size_t i = 0; i < size_; ++i) {
+                                out.push_back(slots_[i].take());
+                            }
+                            dst_->emplace_value(std::move(out));
+                        }
+                    } catch (...) {
+                        dst_->set_exception(std::current_exception());
+                    }
+                }
+                finish_or_defer(std::move(dst_));
+            }
+
+        private:
+            struct no_slots {};
+
+            std::shared_ptr<shared_state<result_t>> dst_;
+            std::atomic<std::size_t> remaining_;
+            std::atomic<bool> errored_{false};
+            std::exception_ptr first_err_;
+            [[no_unique_address]]
+            std::conditional_t<std::is_void_v<T>, no_slots, std::unique_ptr<value_slot<T>[]>>
+                slots_;
+            std::size_t size_ = 0;
+        };
+
+        template <typename ParentState, typename Core>
+        struct range_deposit_cont final
+            : cont_impl<ParentState, range_deposit_cont<ParentState, Core>> {
+            std::shared_ptr<Core> core;
+            std::size_t index;
+
+            void run(ParentState& parent) noexcept {
+                deliver(
+                    parent,
+                    [&](auto&&... v) {
+                        if constexpr (sizeof...(v) != 0) {
+                            core->put(index, std::forward<decltype(v)>(v)...);
+                        }
+                    },
+                    [&](std::exception_ptr e) { core->record_error(std::move(e)); });
+                core->settle_one();
+            }
+        };
+
+        template <typename T>
+        inline constexpr bool is_task_v = false;
+        template <typename T>
+        inline constexpr bool is_task_v<task<T>> = true;
+
         /// 失败出口声明(定义置于 task 完整定义之后)
         template <typename T>
         [[nodiscard]]
         task<T> failed_task(std::exception_ptr e) noexcept;
 
-        /// 续延体的结果类型: void 父任务的续延无参, 非 void 接收 T&&
+        /// 续延体的结果类型: void 父任务的续延无参, 非 void 按 invoke_value 调用.
         /// 特化而非 std::conditional_t, 避免 T=void 时形成 void&&
         template <typename T, typename F>
         struct cont_result {
-            using type = std::invoke_result_t<F, T&&>;
+            using type = decltype(invoke_value(std::declval<F&>(), std::declval<T&&>()));
         };
         template <typename F>
         struct cont_result<void, F> {
-            using type = std::invoke_result_t<F>;
+            using type = std::invoke_result_t<F&>;
         };
         template <typename T, typename F>
         using cont_result_t = typename cont_result<T, F>::type;
@@ -689,18 +838,26 @@ namespace huxint::nexus {
             return st_ != nullptr;
         }
 
-        /// 变换成功值: f 接收 T&&(void 任务无参), 在完成任务的工作线程上内联执行
+        /// 是否已完成(不阻塞); 无效句柄为 false
+        [[nodiscard]]
+        bool ready() const noexcept {
+            return st_ && st_->is_done();
+        }
+
+        /// 变换成功值: f 接收 T&&(void 任务无参; 元组值可按元素展开接收),
+        /// 在完成任务的工作线程上内联执行
         template <typename F>
-        task<detail::cont_result_t<T, F>> map(F&& f) {
-            using U = detail::cont_result_t<T, F>;
+        task<detail::cont_result_t<T, std::decay_t<F>>> map(F&& f) {
+            using U = detail::cont_result_t<T, std::decay_t<F>>;
             return attach_cont<U, detail::map_cont<state_t, std::decay_t<F>, U>>(
                 std::forward<F>(f));
         }
 
         /// 绑定: f 接收 T&& 返回后续 task, 其结果透传为本次结果
         template <typename F>
-        auto and_then(F&& f) -> task<typename detail::cont_result_t<T, F>::value_type> {
-            using inner_t = detail::cont_result_t<T, F>;
+        auto and_then(F&& f)
+            -> task<typename detail::cont_result_t<T, std::decay_t<F>>::value_type> {
+            using inner_t = detail::cont_result_t<T, std::decay_t<F>>;
             return attach_cont<typename inner_t::value_type,
                                detail::and_then_cont<state_t, std::decay_t<F>, inner_t>>(
                 std::forward<F>(f));
@@ -798,6 +955,54 @@ namespace huxint::nexus {
             return task<std::tuple<Ts...>>{std::move(dst)};
         } catch (...) { // make_state / 汇合核心的 bad_alloc
             return detail::failed_task<std::tuple<Ts...>>(std::current_exception());
+        }
+    }
+
+    /**
+     * @brief 汇合一组同类任务: 全部成功 -> task<vector<T>>(按区间原序; void 任务
+     *        汇成 task<void>); 任一失败/取消 -> 以首个错误失败
+     *
+     * 句柄被逐个取走, 故只接受右值区间: when_all(std::move(tasks))
+     */
+    template <std::ranges::sized_range R>
+        requires detail::is_task_v<std::ranges::range_value_t<R>> &&
+                 (!std::is_lvalue_reference_v<R>)
+    [[nodiscard]]
+    auto when_all(R&& tasks)
+        -> task<detail::when_all_range_t<typename std::ranges::range_value_t<R>::value_type>> {
+        using T = typename std::ranges::range_value_t<R>::value_type;
+        using result_t = detail::when_all_range_t<T>;
+        try {
+            auto dst = detail::make_state<result_t>();
+            const auto n = static_cast<std::size_t>(std::ranges::size(tasks));
+            if (n == 0) {
+                dst->emplace_value();
+                dst->finish();
+                return task<result_t>{std::move(dst)};
+            }
+            using core_t = detail::when_all_range_core<T>;
+            auto core = std::make_shared<core_t>(dst, n);
+            std::size_t i = 0;
+            for (auto&& t : tasks) {
+                auto st = detail::task_access::release(std::move(t));
+                const std::size_t index = i++;
+                if (!st) [[unlikely]] {
+                    core->record_error(invalid_task_error());
+                    core->settle_one();
+                    continue;
+                }
+                auto* node = new (std::nothrow)
+                    detail::range_deposit_cont<detail::shared_state<T>, core_t>{{}, core, index};
+                if (!node) {
+                    core->record_error(std::make_exception_ptr(std::bad_alloc{}));
+                    core->settle_one();
+                    continue;
+                }
+                detail::attach_or_run(*st, node);
+            }
+            return task<result_t>{std::move(dst)};
+        } catch (...) { // make_state / 汇合核心的 bad_alloc
+            return detail::failed_task<result_t>(std::current_exception());
         }
     }
 

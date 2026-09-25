@@ -9,38 +9,42 @@
 using namespace huxint::nexus;
 
 int main() {
-    // 基础用法: submit 返回 expected<task<T>, submit_error>
+    // 基础用法: submit 返回 task<T>, 提交失败同样经 get() 的错误通道报告
     pool p({.threads = 4});
 
     // 即发即忘(callable 需 noexcept)
     std::atomic<int> fire{0};
-    static_cast<void>(
-        p.execute([&fire]() noexcept { fire.fetch_add(1, std::memory_order_relaxed); }));
+    p.execute([&fire]() noexcept { fire.fetch_add(1, std::memory_order_relaxed); });
     p.wait();
     std::println("fire-and-forget count: {}", fire.load());
 
     // 有返回值
     auto f1 = p.submit([] { return true; });
     auto f2 = p.submit([](int a, int b) { return a + b; }, 10, 20);
-
-    if (f1 && f2) {
-        auto r1 = f1->get();
-        auto r2 = f2->get();
-        if (r1 && r2) {
-            std::println("result: {}, {}", *r1, *r2);
-        }
+    auto r1 = f1.get();
+    auto r2 = f2.get();
+    if (r1 && r2) {
+        std::println("result: {}, {}", *r1, *r2);
     }
 
-    // 函数式组合子: when_all + map
-    auto a = p.submit([] { return 100; });
-    auto b = p.submit([] { return 200; });
-    if (a && b) {
-        auto sum = when_all(std::move(*a), std::move(*b)).map([](auto&& tup) {
-            return std::get<0>(tup) + std::get<1>(tup);
-        });
-        if (auto r = sum.get()) {
-            std::println("when_all sum: {}", *r);
-        }
+    // 函数式组合子: when_all 汇合, map 按元素展开元组
+    auto sum = when_all(p.submit([] { return 100; }), p.submit([] { return 200; }))
+                   .map([](int x, int y) { return x + y; });
+    if (auto r = sum.get()) {
+        std::println("when_all sum: {}", *r);
+    }
+
+    // 批量: 同类任务区间汇合为 task<vector<T>>
+    std::vector<int> nums{1, 2, 3, 4};
+    if (auto batch = p.submit_each(nums, [](int x) { return x * 10; })) {
+        auto all = when_all(std::move(*batch)).get();
+        std::println("submit_each + when_all: {}", all.value_or(std::vector<int>{}));
+    }
+
+    // 并行遍历: 阻塞至全部完成, 返回首个错误
+    std::vector<int> scaled(8, 1);
+    if (parallel_for(p, scaled, [](int& x) { x *= 7; })) {
+        std::println("parallel_for: {}", scaled);
     }
 
     // 惰性并行批量: 构造不提交, begin()/run() 时整批入队, 按输入顺序取回
@@ -68,26 +72,22 @@ int main() {
         "important log");
 
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    if (log_task) {
-        log_task->request_stop(); // 请求取消日志任务
-    }
+    log_task.request_stop(); // 请求取消日志任务
 
     // 带优先级(callable 需 noexcept)
-    basic_pool<decltype(priority)> prio_pool({.threads = 2});
-    static_cast<void>(
-        prio_pool.execute(task_priority::low, []() noexcept { std::println("low-priority task"); }));
-    static_cast<void>(
-        prio_pool.execute(task_priority::high, []() noexcept { std::println("high-priority task"); }));
+    basic_pool<priority> prio_pool({.threads = 2});
+    prio_pool.execute(task_priority::low, []() noexcept { std::println("low-priority task"); });
+    prio_pool.execute(task_priority::high, []() noexcept { std::println("high-priority task"); });
     prio_pool.wait();
 
     // trace 钩子: 三阶段事件流(enqueue / begin / end)
-    basic_pool<decltype(trace)> traced(
+    basic_pool<trace> traced(
         {.threads = 2,
          .hooks = {.on_enqueue = {}, .on_begin = {}, .on_end = [](trace_event e) noexcept {
                        std::println("[trace] task {} finished, outcome {}", e.id,
                                     static_cast<int>(e.outcome));
                    }}});
-    static_cast<void>(traced.execute([]() noexcept {}));
+    traced.execute([]() noexcept {});
     traced.wait();
 
     return 0;
