@@ -880,6 +880,13 @@ namespace huxint::nexus {
             }
             try {
                 auto child = detail::make_state<U>();
+                // 已完成的父状态无需发布续延: 栈上运行免去一次节点分配.
+                // acquire 完成观测提供结果可见性; claim 仍裁决并发领取.
+                if (st_->is_done()) {
+                    Node node{{}, child, std::forward<A>(a)...};
+                    node.run(*st_);
+                    return task<U>{std::move(child)};
+                }
                 auto* n = new (std::nothrow) Node{{}, child, std::forward<A>(a)...};
                 if (!n) {
                     return detail::failed_task<U>(std::make_exception_ptr(std::bad_alloc{}));

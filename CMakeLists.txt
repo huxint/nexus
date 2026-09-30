@@ -55,6 +55,15 @@ target_link_libraries(nexus_bench PRIVATE nexus)
 target_include_directories(nexus_bench PRIVATE benchmarks benchmarks/third_party/taskflow_repo)
 nexus_own_compile_options(nexus_bench)
 
+# 独立粒度扫描: wall time / CPU time 与单独采集的 trace 任务数.
+add_executable(nexus_parallel_bench benchmarks/parallel_bench.cpp)
+target_link_libraries(nexus_parallel_bench PRIVATE nexus)
+nexus_own_compile_options(nexus_parallel_bench)
+
+add_executable(nexus_allocation_bench benchmarks/allocation_bench.cpp)
+target_link_libraries(nexus_allocation_bench PRIVATE nexus)
+nexus_own_compile_options(nexus_allocation_bench)
+
 # oneTBB: 系统包引入(未随仓库分发), 未找到时跳过 TBB 对比行
 find_package(TBB CONFIG QUIET)
 if(TBB_FOUND)

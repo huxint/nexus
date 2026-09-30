@@ -21,25 +21,49 @@
 
 ## 性能
 
-已有测量记录：**Intel i7-12650H、GCC 16.2、Release，4 次完整运行取中位数**。
+2026-09-30 实测：**Intel i7-12650H、GCC 16.2.1、Release、8 个 worker**。
+主基准吞吐与耗时取 3 次运行中的最佳值，延迟报告采样分位数。
 
-| 场景 | Taskflow | BS::thread_pool | oneTBB | mcq 对比池 | nexus |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| 单生产者即发即忘 · M/s | 1.30 | 0.37 | 3.51 | 2.73 | **7.72** |
-| 逐个提交并取回 · M/s | 0.35 | 0.23 | — | — | **1.90** |
-| 递归 fork-join · M leaves/s | 8.66 | 1.24 | **25.47** | 5.47 | 23.06 |
-| 多生产者 ×8 · M/s | 2.41 | 1.32 | 6.66 | 6.55 | **7.05** |
-| 空池往返 P50 / P99 · µs | 2.75 / 6.63 | 4.59 / 8.22 | — | — | **0.51 / 1.10** |
+| 场景 | Taskflow | BS::thread_pool | nexus |
+| :--- | ---: | ---: | ---: |
+| 单生产者即发即忘 · M/s | 1.24 | 0.40 | **8.39** |
+| 逐个提交并取回 · M/s | 0.38 | 0.27 | **2.09** |
+| 递归 fork-join · M leaves/s | 8.62 | 1.23 | **28.40** |
+| 多生产者 ×8 · M/s | 2.76 | 1.36 | **7.60** |
+| 空池往返 P50 / P99 · µs | 2.66 / 7.44 | 3.75 / 6.01 | **0.44 / 0.87** |
 
-M/s 为百万任务/秒，M leaves/s 为百万叶任务/秒；`—` 表示无对照数据。mcq 池基于 moodycamel 队列。基准包含共享原子计数器竞争，池创建与销毁不计时。
+同一轮完整基准中的扩展对照独立采样：
 
-这组数据中，nexus 在短任务提交与往返延迟上领先，纯递归分治则是 oneTBB 更快。
+| 场景 | oneTBB | mcq 对比池 | nexus |
+| :--- | ---: | ---: | ---: |
+| 单生产者即发即忘 · M/s | 3.65 | 2.62 | **8.40** |
+| 递归 fork-join · M leaves/s | 25.69 | 5.90 | **27.39** |
+| 多生产者 ×8 · M/s | 6.53 | 7.18 | **7.31** |
+
+M/s 为百万任务/秒，M leaves/s 为百万叶任务/秒。mcq 池基于 moodycamel 队列。
+上述负载包含共享原子计数器竞争，池创建与销毁不计时。
+算力型负载不总是领先：固定计算负载、4 线程时，nexus 为 3.26 ms，Taskflow 为 2.59 ms。
+
+**默认 `parallel_for` 优化前后**：同机、8 个 worker、262,144 个元素，使用
+[独立基准](benchmarks/parallel_bench.cpp) 对照提交 `464e331`。
+新旧版本交替运行三组，每组预热后测量七次，取各组中位数的中位数；业务负载无共享写计数器。
+
+| 负载 | 修改前 / ms | 修改后 / ms | 加速 |
+| :--- | ---: | ---: | ---: |
+| 均匀 | 99.62 | 1.92 | 51.9× |
+| 末尾重计算 | 101.32 | 1.86 | 54.5× |
+| 开头重计算 | 103.18 | 1.83 | 56.5× |
+
+调度任务从 262,144 个降到 8 个，元素回调次数不变。已手动调优的显式分块基本持平。
+已完成任务连续 `map` 10,000 次，普通 `operator new` 调用从 20,000 次降到 10,000 次。
+数据受负载和机器状态影响；上述倍数针对原来的逐元素调度路径。
+
+按下方构建步骤编译后，可直接运行：
 
 ```bash
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target nexus_bench -j
-./build/nexus_bench --quick  # 缩减规模
-./build/nexus_bench          # 完整对照；系统安装 oneTBB 后自动加入
+./build/nexus_bench             # 完整第三方对照
+./build/nexus_parallel_bench    # 并行粒度扫描
+./build/nexus_allocation_bench  # 分配计数
 ```
 
 [CodSpeed](https://app.codspeed.io/huxint/nexus) 在 push / PR 上持续追踪提交、组合与批量并行的调度开销，并与第三方库对照。simulation 模式串行化线程，衡量指令成本，不代表真实并行加速比。配置见 [CI 工作流](.github/workflows/codspeed.yml)。
@@ -78,8 +102,15 @@ int main() {
 | `submit_each(range, f)` | 批量提交，返回 `expected<vector<task<R>>, submit_error>` |
 | `fork_join(f, g)` | `f` 入队、`g` 内联执行；`f` 须 `noexcept`，提交失败时不执行 `g`；由外部 `p.wait()` 汇合 |
 | `parallel_map(p, range, f)` | 惰性视图，首次迭代整批提交，按输入顺序交付结果；`batch_error()` 检查批量提交错误 |
-| `parallel_for(p, range, f)` | 并行遍历，阻塞至完成并返回状态 |
+| `parallel_for(p, range, f)` | 对每个元素调用 `f`，阻塞至完成并返回状态 |
 | `parallel_map_chunked` / `parallel_for_chunked` | 按 `grain` 分块，回调接收子区间视图 |
+
+`parallel_for` 自动安排调度，单个元素抛出异常后仍会处理其余元素。
+需要按子区间处理或每块返回一个结果时使用 `*_chunked`；`grain` 决定回调看到的块大小，
+省略时取池线程数。
+
+多趟区间的左值元素按引用访问，可原地修改；单趟输入（如 `std::views::istream`）和代理引用
+按值快照，回调修改快照不会写回输入。所有快照准备成功后才发布任务。
 
 ### 任务组合
 
@@ -90,7 +121,8 @@ int main() {
 | `inspect(f)` | 观察成功值，保留原结果 |
 | `when_all(tasks...)` / `when_all(vector<task<T>>)` | 汇合为元组 / 向量结果 |
 
-续延内联执行，适合短计算；重计算可在 `and_then` 中再次 `submit`。
+续延内联执行，适合短计算；父任务已完成时直接在调用线程执行，并省去续延节点分配。
+重计算可在 `and_then` 中再次 `submit`。
 
 ### 等待与取消
 

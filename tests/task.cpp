@@ -9,6 +9,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -66,6 +67,52 @@ TEST_SUITE("huxint::nexus.task") {
         t.wait();                                    // 先等它跑完
         auto m = t.map([](int v) { return v * v; }); // 再附着 => 走内联路径
         CHECK(m.get().value_or(-1) == 25);
+    }
+
+    TEST_CASE("completed_continuations_preserve_lifetimes_and_errors") {
+        pool p({.threads = 2});
+        auto root = p.submit([] { return std::make_unique<int>(7); });
+        root.wait();
+        auto inspected = root.inspect([](auto& value) { ++*value; });
+        REQUIRE(inspected.ready());
+        auto bound = inspected.and_then([&](auto value) {
+            return p.submit([value = std::move(value)] { return *value; });
+        });
+        CHECK(bound.get().value_or(-1) == 8);
+
+        auto failed = p.submit([]() -> int { throw std::runtime_error("upstream"); });
+        failed.wait();
+        bool called = false;
+        auto skipped = failed.map([&](int) { called = true; });
+        REQUIRE(skipped.ready());
+        auto result = skipped.get();
+        REQUIRE(!result);
+        CHECK_THROWS_AS(std::rethrow_exception(result.error()), std::runtime_error);
+        CHECK_FALSE(called);
+    }
+
+    TEST_CASE("completed_value_is_claimed_once_by_competing_continuations") {
+        pool p({.threads = 2});
+        auto root = p.submit([] { return std::make_unique<int>(42); });
+        root.wait();
+        task<int> left, right;
+        std::atomic<bool> start{false};
+        auto claim = [&](task<int>& out) {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            out = root.map([](auto value) { return *value; });
+        };
+        std::jthread a([&] { claim(left); });
+        std::jthread b([&] { claim(right); });
+        start.store(true, std::memory_order_release);
+        a.join();
+        b.join();
+        auto l = left.get();
+        auto r = right.get();
+        REQUIRE(l.has_value() != r.has_value());
+        CHECK((l ? *l : *r) == 42);
+        CHECK(is_invalid_task(l ? r.error() : l.error()));
     }
 
     TEST_CASE("map_to_void_on_valued_task") {
@@ -408,6 +455,7 @@ TEST_SUITE("huxint::nexus.task") {
         };
         pool p({.threads = 1});
         auto t = p.submit([] { return 1; });
+        t.wait(); // 确定经过已完成任务的快路径.
         const throwing_copy f;
         auto r = t.map(f).get();
         REQUIRE(!r.has_value());

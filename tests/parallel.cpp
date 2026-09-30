@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <forward_list>
 #include <memory>
 #include <numeric>
 #include <ranges>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -558,7 +560,7 @@ TEST_SUITE("huxint::nexus.parallel") {
         CHECK(blocks == std::size_t{15}); // ceil(100/7)
     }
 
-    // grain == 0: 块大小取池线程数
+    // grain == 0: 块大小取池线程数.
     TEST_CASE("chunked_grain_zero_auto_sizes") {
         pool p({.threads = 4});
         std::vector<int> data(100, 1);
@@ -704,5 +706,178 @@ TEST_SUITE("huxint::nexus.parallel") {
         }
         p.wait();
         CHECK(calls.load() == 0);
+    }
+}
+
+TEST_SUITE("huxint::nexus.parallel.bulk") {
+    TEST_CASE("single_pass_lvalues_are_snapshotted") {
+        pool p({.threads = 2});
+        std::istringstream input("1 2 3 4");
+        auto v = parallel_map(p, std::views::istream<int>(input), [](int& x) { return x * 2; });
+        std::vector<int> got;
+        for (auto r : v) {
+            REQUIRE(r);
+            got.push_back(*r);
+        }
+        CHECK(got == std::vector<int>{2, 4, 6, 8});
+
+        std::istringstream other("1 2 3 4");
+        std::atomic<int> sum{0};
+        REQUIRE(parallel_for(p, std::views::istream<int>(other), [&](int& x) {
+            sum.fetch_add(x, std::memory_order_relaxed);
+            x = 0; // 只能改自己的快照
+        }));
+        CHECK(sum == 10);
+    }
+
+    TEST_CASE("proxy_values_use_the_actual_callback_argument_type") {
+        pool p({.threads = 2});
+        std::vector<bool> bits{true, false, true};
+        auto v = parallel_map(p, bits, [](bool b) { return b ? 1 : 0; });
+        int sum = 0;
+        for (auto r : v) {
+            REQUIRE(r);
+            sum += *r;
+        }
+        CHECK(sum == 2);
+        std::atomic<int> seen{0};
+        REQUIRE(parallel_for(p, bits, [&](bool b) { seen.fetch_add(b); }));
+        CHECK(seen == 2);
+    }
+
+    TEST_CASE("bulk_covers_tails_and_keeps_per_element_errors_isolated") {
+        pool p({.threads = 4});
+        std::vector<int> data(1003, 0);
+        auto r = parallel_for(p, data, [](int& x) {
+            ++x;
+            throw std::runtime_error("element");
+        });
+        REQUIRE(!r);
+        CHECK_THROWS_AS(std::rethrow_exception(r.error()), std::runtime_error);
+        CHECK(std::ranges::all_of(data, [](int x) { return x == 1; }));
+    }
+
+    TEST_CASE("bulk_visits_every_element_once_across_input_sizes") {
+        pool p({.threads = 4});
+        for (auto n : {0uz, 1uz, 3uz, 65uz, 8193uz}) {
+            CAPTURE(n);
+            std::vector<std::atomic<int>> visits(n);
+            REQUIRE(parallel_for(p, visits, [](auto& count) { ++count; }));
+            CHECK(std::ranges::all_of(visits, [](auto& count) { return count.load() == 1; }));
+        }
+    }
+
+    TEST_CASE("bulk_bounds_tasks_and_explicit_chunks_are_scheduled_independently") {
+        std::atomic<std::size_t> enqueued{0};
+        trace_hooks hooks;
+        hooks.on_enqueue = [&](trace_event) noexcept { enqueued.fetch_add(1); };
+        basic_pool<trace> p({.threads = 4, .hooks = std::move(hooks)});
+        std::vector<int> data(1003, 0);
+        REQUIRE(parallel_for(p, data, [](int& x) { ++x; }));
+        CHECK(enqueued.load() <= p.thread_count());
+        CHECK(enqueued.load() > 1);
+        enqueued = 0;
+        std::atomic<std::size_t> calls{0};
+        auto r = parallel_for_chunked(p, data, [&](auto block) {
+            ++calls;
+            for (auto& x : block) {
+                ++x;
+            }
+        }, 1);
+        REQUIRE(r);
+        CHECK(calls == data.size());
+        CHECK(enqueued == data.size());
+        CHECK(std::ranges::all_of(data, [](int x) { return x == 2; }));
+    }
+
+    TEST_CASE("single_pass_preparation_failure_runs_no_callbacks") {
+        pool p({.threads = 2});
+        std::istringstream input("1 2 bad");
+        input.exceptions(std::ios::failbit);
+        std::atomic<int> ran{0};
+        auto r = parallel_for(p, std::views::istream<int>(input), [&](int) { ++ran; });
+        REQUIRE(!r);
+        CHECK_THROWS_AS(std::rethrow_exception(r.error()), std::ios_base::failure);
+        CHECK(ran == 0);
+    }
+
+    TEST_CASE("non_contiguous_forward_elements_are_borrowed") {
+        pool p({.threads = 2});
+        std::forward_list<int> data{1, 2, 3, 4};
+        REQUIRE(parallel_for(p, data, [](int& x) { x *= 2; }));
+        CHECK(std::ranges::equal(data, std::vector<int>{2, 4, 6, 8}));
+    }
+
+    TEST_CASE("generated_move_only_values_survive_preparation") {
+        pool p({.threads = 2});
+        auto data = std::views::iota(0, 100) | std::views::transform([](int i) {
+            return std::make_unique<int>(i);
+        });
+        std::atomic<int> sum{0};
+        REQUIRE(parallel_for(p, data, [&](std::unique_ptr<int> x) { sum.fetch_add(*x); }));
+        CHECK(sum == 4950);
+    }
+
+    TEST_CASE("large_ranges_preserve_default_and_explicit_chunk_boundaries") {
+        pool p({.threads = 4});
+        std::vector<int> data(10003, 1);
+        auto v = parallel_map_chunked(p, data, [](auto block) {
+            return std::ranges::distance(block);
+        });
+        std::ptrdiff_t total = 0;
+        for (auto r : v) {
+            REQUIRE(r);
+            total += *r;
+        }
+        CHECK(total == 10003);
+        CHECK(v.submitted() == 2501); // ceil(10003 / 4), 与调度策略无关.
+        std::atomic<int> blocks{0};
+        auto r = parallel_for_chunked(p, data, [&](auto block) {
+            CHECK(std::ranges::distance(block) <= 37);
+            blocks.fetch_add(1);
+        }, 37);
+        REQUIRE(r);
+        CHECK(blocks == 271);
+    }
+
+    TEST_CASE("bulk_discard_settles_waiter_and_drains_running_work") {
+        tu::deadlock_watchdog wd(10s, "bulk discard");
+        std::atomic<bool> first{false}, release{false};
+        std::atomic<std::size_t> enqueued{0};
+        trace_hooks hooks;
+        hooks.on_enqueue = [&](trace_event) noexcept { ++enqueued; };
+        basic_pool<trace> p({.threads = 2, .hooks = std::move(hooks)});
+        tu::gate occupied;
+        occupied.block_all(p, 1); // 留一个 worker 执行, 另一个批量任务保持排队.
+        enqueued = 0;
+        std::vector<int> data(1000, 0);
+        std::expected<void, std::exception_ptr> result;
+        std::jthread caller([&] {
+            result = parallel_for(p, data, [&](int& x) {
+                first = true;
+                while (!release.load()) {
+                    std::this_thread::yield();
+                }
+                ++x;
+            });
+        });
+        while (!first.load() || enqueued.load() != 2) {
+            std::this_thread::yield();
+        }
+        std::jthread closer([&] { p.shutdown(shutdown_policy::discard); });
+        // 等待关闭闸门生效, 再放行运行中的块.
+        while (p.execute([]() noexcept {})) {
+            std::this_thread::yield();
+        }
+        release = true;
+        occupied.release();
+        caller.join();
+        closer.join();
+        // discard 为 best-effort; 返回后不再访问数据, 元素不能重复执行.
+        CHECK(std::ranges::count(data, 1) > 0);
+        CHECK(std::ranges::all_of(data, [](int x) { return x == 0 || x == 1; }));
+        if (!result) {
+            CHECK(is_cancelled(result.error()));
+        }
     }
 }

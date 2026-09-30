@@ -79,5 +79,17 @@ int main() {
     if (ctotal != 21) { // 1..6 之和
         return 1;
     }
+    if (!huxint::nexus::parallel_for(p, data2, [](int& x) { x *= 2; }) ||
+        std::accumulate(std::begin(data2), std::end(data2), 0) != 42) {
+        return 1;
+    }
+    auto modified = huxint::nexus::parallel_for_chunked(p, data2, [](auto block) {
+        for (auto& x : block) {
+            ++x;
+        }
+    }, 3);
+    if (!modified || std::accumulate(std::begin(data2), std::end(data2), 0) != 48) {
+        return 1;
+    }
     return 0;
 }

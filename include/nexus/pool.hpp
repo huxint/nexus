@@ -344,6 +344,13 @@ namespace huxint::nexus {
             using R = detail::submit_result_t<F, elem_t>;
 
             std::vector<task<R>> out;
+            if constexpr (std::ranges::sized_range<Rng>) {
+                try {
+                    out.reserve(static_cast<std::size_t>(std::ranges::size(rng)));
+                } catch (const std::bad_alloc&) {
+                    return std::unexpected(submit_error::out_of_memory);
+                }
+            }
             auto ok = emit_each(rng, [&](auto&& e) -> std::pair<node_t*, tracer_t> {
                 // 句柄槽先于节点备好: 节点一经建成即归骨架回滚, 其后的登记不得再抛
                 if (out.size() == out.capacity()) {

@@ -21,11 +21,27 @@ namespace huxint::nexus {
 
     namespace detail {
 
-        /// 元素在任务闭包中的携带方式. 真左值引用 -> 存指针(零拷贝, 指向底层区间);
-        /// 生成式区间产出的 prvalue -> 存值副本(否则闭包运行时已悬垂)
+        /// 多趟区间的左值引用可借用; 单趟输入可能反复引用同一个缓存,
+        /// 必须在推进迭代器前保存值快照. prvalue/proxy 同样保存 range_value_t.
         template <typename V>
         inline constexpr bool carry_by_pointer_v =
+            std::ranges::forward_range<V> &&
             std::is_lvalue_reference_v<std::ranges::range_reference_t<V>>;
+
+        /// 快照仍按输入的值类别交付: istream 的 int& 引用自己的副本,
+        /// iota 的 prvalue 以右值交付. 约束和结果推导必须使用实际交付类型.
+        template <typename V>
+        using parallel_arg_t = std::conditional_t<
+            carry_by_pointer_v<V>, std::ranges::range_reference_t<V>,
+            std::conditional_t<std::is_lvalue_reference_v<std::ranges::range_reference_t<V>>,
+                               std::ranges::range_value_t<V>&, std::ranges::range_value_t<V>&&>>;
+
+        template <typename V, typename F>
+        concept parallel_callable = std::ranges::input_range<V> &&
+            std::invocable<F&, parallel_arg_t<V>> &&
+            (carry_by_pointer_v<V> ||
+             std::constructible_from<std::ranges::range_value_t<V>,
+                                     std::ranges::range_reference_t<V>>);
 
     } // namespace detail
 
@@ -58,7 +74,7 @@ namespace huxint::nexus {
 
     public:
         /// f 的返回类型
-        using result_type = std::invoke_result_t<F&, elem_ref>;
+        using result_type = std::invoke_result_t<F&, detail::parallel_arg_t<V>>;
         /// 迭代产出的元素类型
         using value_type = std::expected<result_type, std::exception_ptr>;
 
@@ -172,7 +188,7 @@ namespace huxint::nexus {
                         return pool_->submit_each(
                             std::ranges::ref_view(range_),
                             [fn](std::ranges::range_value_t<V> v) mutable {
-                                return std::invoke(*fn, std::move(v));
+                                return std::invoke(*fn, static_cast<detail::parallel_arg_t<V>>(v));
                             });
                     }
                 }();
@@ -229,7 +245,7 @@ namespace huxint::nexus {
      * @warning 惰性: 不迭代(或不调用 run())则一个任务都不会提交
      */
     template <typename Pool, std::ranges::input_range R, typename F>
-        requires std::invocable<F&, std::ranges::range_reference_t<R>>
+        requires detail::parallel_callable<R, F>
     [[nodiscard]]
     auto parallel_map(Pool& p, R&& range, F fn) {
         using view_t = std::views::all_t<R&&>;
@@ -239,18 +255,36 @@ namespace huxint::nexus {
 
     namespace detail {
 
-        /// parallel_for 的汇合点: 剩余计数 + 首错. 计数只在整批发布前(单线程)
-        /// 累加, 发布后由各元素递减; 归零方推进池的空闲代际唤醒等待方
+        /// parallel_for 的汇合点: 发布前确定任务数, 完结时递减并保留首错.
+        /// 归零方推进池的空闲代际, 唤醒等待方.
         class for_join {
         public:
+            explicit for_join(std::size_t count) noexcept : remaining_(count) {}
+
+            /// 用于未知长度的分块视图; 只在整批发布前调用.
             void add() noexcept { remaining_.fetch_add(1, std::memory_order_relaxed); }
+
+            template <typename Pool, typename R, typename Make>
+            std::expected<void, std::exception_ptr> run(Pool& p, R&& range, Make&& make) {
+                try {
+                    if (auto ok = pool_access::execute_each(
+                            p, std::forward<R>(range), std::forward<Make>(make)); !ok) {
+                        return std::unexpected(submit_error_ptr(ok.error()));
+                    }
+                } catch (...) {
+                    return std::unexpected(std::current_exception());
+                }
+                auto done = [&] { return this->done(); };
+                pool_access::help_until(p, done, [&] { pool_access::sleep_until_bumped(p, done); });
+                return result();
+            }
 
             [[nodiscard]]
             bool done() const noexcept {
                 return remaining_.load(std::memory_order_acquire) == 0;
             }
 
-            /// 一个元素的完结: 执行(或以取消语义丢弃)并计数. 首错的写入经
+            /// 一个调度任务的完结: 执行(或以取消语义丢弃)并计数. 首错的写入经
             /// remaining_ 上 RMW 的释放序列对等待方可见. 归零后本对象随时可能
             /// 被等待方销毁, 故唤醒经闭包持有的池引用完成, 不再触碰 self
             template <typename Pool, typename Body>
@@ -258,14 +292,20 @@ namespace huxint::nexus {
                 if (!run) {
                     self->fail(shared_error<operation_cancelled>());
                 } else {
-                    try {
-                        body();
-                    } catch (...) {
-                        self->fail(std::current_exception());
-                    }
+                    self->invoke(std::forward<Body>(body));
                 }
                 if (self->remaining_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     pool_access::bump(p);
+                }
+            }
+
+            /// 每元素隔离异常: 一个元素失败不能跳过同块剩余元素.
+            template <typename Body>
+            void invoke(Body&& body) noexcept {
+                try {
+                    body();
+                } catch (...) {
+                    fail(std::current_exception());
                 }
             }
 
@@ -285,60 +325,121 @@ namespace huxint::nexus {
                 }
             }
 
-            std::atomic<std::size_t> remaining_{0};
+            std::atomic<std::size_t> remaining_;
             std::atomic<bool> errored_{false};
             std::exception_ptr first_;
         };
 
+        /// 只为 worker 任务分配节点和记账, 小块由一个游标分发.
+        /// 元素访问器与其引用的数据存活至帮助式汇合结束.
+        template <typename Pool, typename F>
+        std::expected<void, std::exception_ptr> bulk_for(Pool& p, std::size_t n, F&& fn) {
+            constexpr auto blocks_per_worker = 128uz;
+            const auto threads = p.thread_count();
+            const auto per_worker = n / threads + (n % threads != 0);
+            const auto grain = std::max(
+                1uz, per_worker / blocks_per_worker + (per_worker % blocks_per_worker != 0));
+            const auto blocks = n / grain + (n % grain != 0);
+            const auto tasks = std::min(blocks, threads);
+            for_join join{tasks};
+            // 首块按任务号分配; 后续领取只需一次 relaxed RMW.
+            // 块数与线程数成比例, 游标不会随元素总数膨胀.
+            std::atomic<std::size_t> next{tasks};
+            auto work = [&](std::size_t block) {
+                for (;;) {
+                    const auto first = block * grain;
+                    const auto last = first + std::min(grain, n - first);
+                    for (auto i = first; i < last; ++i) {
+                        join.invoke([&] { std::invoke(fn, i); });
+                    }
+                    block = next.fetch_add(1, std::memory_order_relaxed);
+                    if (block >= blocks) {
+                        return;
+                    }
+                }
+            };
+            auto make = [&](std::size_t block) {
+                return [self = &join, pool = &p, f = &work, block](bool run) noexcept {
+                    for_join::settle(self, *pool, run, [&] { (*f)(block); });
+                };
+            };
+            return join.run(p, std::views::iota(std::size_t{0}, tasks), make);
+        }
+
+        template <typename R>
+        struct carried_element {
+            using storage_t = std::conditional_t<carry_by_pointer_v<R>,
+                std::add_pointer_t<std::remove_reference_t<std::ranges::range_reference_t<R>>>,
+                std::ranges::range_value_t<R>>;
+            storage_t value;
+
+            explicit carried_element(std::ranges::range_reference_t<R> e)
+                : value([&]() -> storage_t {
+                    if constexpr (carry_by_pointer_v<R>) {
+                        return std::addressof(e);
+                    } else {
+                        return storage_t(std::forward<std::ranges::range_reference_t<R>>(e));
+                    }
+                }()) {}
+
+            parallel_arg_t<R> get() {
+                if constexpr (carry_by_pointer_v<R>) {
+                    return *value;
+                } else {
+                    return static_cast<parallel_arg_t<R>>(value);
+                }
+            }
+        };
+
+        /// 调用方已经划好块: 直接提交, 不再准备另一份元素表或重复分块.
+        template <typename Pool, typename R, typename F>
+        std::expected<void, std::exception_ptr> for_chunks(Pool& p, R&& chunks, F& fn) {
+            for_join join{0};
+            auto make = [&](auto&& chunk) {
+                join.add();
+                return [self = &join, pool = &p, f = &fn,
+                        value = carried_element<R>(std::forward<decltype(chunk)>(chunk))]
+                       (bool run) mutable noexcept {
+                    for_join::settle(self, *pool, run, [&] { std::invoke(*f, value.get()); });
+                };
+            };
+            return join.run(p, std::forward<R>(chunks), make);
+        }
     } // namespace detail
 
     /**
-     * @brief 并行遍历: 对区间每个元素并发调用 f(无返回值), 阻塞至全部完成
+     * @brief 并行遍历: 对每个元素调用 f, 阻塞至全部完成; 单元素失败不跳过其余元素.
      *
-     * 整批一次登记、按批唤醒; 元素任务不带结果通道(无逐元素共享状态分配),
-     * 以一个计数汇合. 调用方是本池 worker 时边等边帮忙执行排队任务, 嵌套
-     * parallel_for 不会因 worker 全部阻塞而死锁
+     * 默认由少量任务动态领取块, 回调仍接收单个元素. 连续区间直接借用;
+     * 其他区间在提交线程准备元素指针/值快照, 保持用户迭代器串行访问与
+     * 准备期失败的整批回滚. 单趟输入的左值引用也必须快照.
      *
-     * 元素携带方式同 parallel_map: 左值区间按指针(f 可原地改写), 生成式区间
-     * 按值. 索引区间可用 `std::views::iota(0, n)` 表达
-     *
-     * @return 首个错误(f 抛出的异常 / 被关闭丢弃的 operation_cancelled / 提交失败的
-     *         submit_error, 后者可经 submit_error_of 还原); 全部成功则为空
+     * 本池 worker 等待时帮助执行任务. f 会被并发调用; 调度粒度由库管理.
      */
     template <typename Pool, std::ranges::input_range R, typename F>
-        requires std::invocable<F&, std::ranges::range_reference_t<R>> &&
-                 std::is_void_v<std::invoke_result_t<F&, std::ranges::range_reference_t<R>>>
+        requires detail::parallel_callable<R, F> &&
+                 std::is_void_v<std::invoke_result_t<F&, detail::parallel_arg_t<R>>>
     [[nodiscard]]
     std::expected<void, std::exception_ptr> parallel_for(Pool& p, R&& range, F fn) {
-        detail::for_join join;
-        auto make = [&](auto&& e) {
-            join.add();
-            if constexpr (std::is_lvalue_reference_v<std::ranges::range_reference_t<R>>) {
-                return [self = &join, pool = &p, f = &fn, elem = std::addressof(e)](
-                           bool run) noexcept {
-                    detail::for_join::settle(self, *pool, run, [&] { std::invoke(*f, *elem); });
-                };
-            } else {
-                return [self = &join, pool = &p, f = &fn,
-                        v = std::ranges::range_value_t<R>(std::forward<decltype(e)>(e))](
-                           bool run) mutable noexcept {
-                    detail::for_join::settle(self, *pool, run,
-                                             [&] { std::invoke(*f, std::move(v)); });
-                };
-            }
-        };
-        // 库表面零 throw: 提交期的用户异常(元素搬运/用户迭代器)经返回值报告
         try {
-            if (auto ok = detail::pool_access::execute_each(p, range, make); !ok) {
-                return std::unexpected(detail::submit_error_ptr(ok.error()));
+            if constexpr (std::ranges::contiguous_range<R> && std::ranges::sized_range<R>) {
+                auto* data = std::ranges::data(range);
+                return detail::bulk_for(p, static_cast<std::size_t>(std::ranges::size(range)),
+                    [&](std::size_t i) { std::invoke(fn, data[i]); });
+            } else {
+                std::vector<detail::carried_element<R>> elements;
+                if constexpr (std::ranges::sized_range<R>) {
+                    elements.reserve(static_cast<std::size_t>(std::ranges::size(range)));
+                }
+                for (auto&& e : range) {
+                    elements.emplace_back(std::forward<decltype(e)>(e));
+                }
+                return detail::bulk_for(p, elements.size(),
+                    [&](std::size_t i) { std::invoke(fn, elements[i].get()); });
             }
         } catch (...) {
             return std::unexpected(std::current_exception());
         }
-        auto done = [&] { return join.done(); };
-        detail::pool_access::help_until(
-            p, done, [&] { detail::pool_access::sleep_until_bumped(p, done); });
-        return join.result();
     }
 
     namespace detail {
@@ -347,11 +448,11 @@ namespace huxint::nexus {
         template <typename R>
         using chunked_of = std::ranges::chunk_view<std::views::all_t<R&&>>;
 
-        /// 分块: grain == 0 时块大小取池线程数
+        /// 回调可见的块边界保持稳定: grain == 0 时块大小取池线程数.
         template <typename Pool, typename R>
         [[nodiscard]]
         chunked_of<R> chunked(const Pool& p, R&& range, std::size_t grain) {
-            const std::size_t size = grain != 0 ? grain : p.thread_count();
+            const auto size = grain != 0 ? grain : p.thread_count();
             return chunked_of<R>{
                 std::views::all(std::forward<R>(range)),
                 static_cast<std::ranges::range_difference_t<std::views::all_t<R&&>>>(size)};
@@ -368,7 +469,7 @@ namespace huxint::nexus {
      *
      * 块是引用底层的视图: 底层区间须比本视图更长寿(同 parallel_map)
      *
-     * @param grain 块大小; 0 = 按 `p.thread_count()` 自动取块
+     * @param grain 块大小; 0 = 按 `p.thread_count()` 取块
      *
      * @warning 惰性: 不迭代(或不调用 run())则一个任务都不会提交
      */
@@ -381,10 +482,10 @@ namespace huxint::nexus {
     }
 
     /**
-     * @brief 分块并行遍历: 每 grain 个元素一块提交, `f` 对每块调用一次,
+     * @brief 分块并行遍历: 每 grain 个元素一块, `f` 对每块调用一次,
      *        接收子区间(range), 阻塞至全部完成. 返回语义同 parallel_for
      *
-     * @param grain 块大小; 0 = 按 `p.thread_count()` 自动取块
+     * @param grain 块大小; 0 = 按 `p.thread_count()` 取块
      */
     template <typename Pool, std::ranges::forward_range R, typename F>
         requires std::invocable<F&, std::ranges::range_reference_t<detail::chunked_of<R>>> &&
@@ -393,7 +494,7 @@ namespace huxint::nexus {
     [[nodiscard]]
     std::expected<void, std::exception_ptr> parallel_for_chunked(Pool& p, R&& range, F fn,
                                                                  std::size_t grain = 0) {
-        return parallel_for(p, detail::chunked(p, std::forward<R>(range), grain), std::move(fn));
+        return detail::for_chunks(p, detail::chunked(p, std::forward<R>(range), grain), fn);
     }
 
 } // namespace huxint::nexus
