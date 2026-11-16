@@ -7,7 +7,6 @@
   <img src="https://img.shields.io/badge/GCC-16.2%2B-099268" alt="GCC 16.2+">
   <img src="https://img.shields.io/badge/header--only-零核心依赖-6741d9" alt="header-only，零核心依赖">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-495057" alt="MIT license"></a>
-  <a href="https://app.codspeed.io/huxint/nexus"><img src="https://img.shields.io/endpoint?url=https://codspeed.io/badge.json" alt="CodSpeed"></a>
 </p>
 
 <p align="center">
@@ -57,9 +56,6 @@ int main() {
 | 递归 fork-join · 百万叶任务/s | 9.86 | 1.38 | **29.06** |
 | 多生产者 ×8 · 百万任务/s | 3.00 | 1.41 | **23.04** |
 | 往返延迟 P50 / P99 · µs | 2.88 / 6.21 | 4.29 / 7.19 | **0.42 / 0.81** |
-
-性能随负载与机器状态变化。[完整对照与测量方法](docs/build.md#基准数据与测量口径) ·
-[CodSpeed 趋势](https://app.codspeed.io/huxint/nexus)
 
 ## 架构
 
