@@ -7,6 +7,8 @@
 
 #include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <thread>
 #include <vector>
 
@@ -340,6 +342,38 @@ TEST_SUITE("huxint::nexus.detail") {
         CHECK(seen == 2);
         CHECK(!big);
         CHECK(live.load() == 0);
+    }
+
+    // 就地存放的准入看对齐: 缺省只保证指针对齐, 更强对齐的可调用体落堆;
+    // 宿主兑现更强对齐(InplaceAlign)时才放宽. 两种存储下对象地址都满足其对齐
+    TEST_CASE("sbo_function_respects_callable_alignment") {
+        struct alignas(16) wide {
+            double v[2]{};
+            std::uintptr_t* seen;
+            void operator()() const noexcept { *seen = reinterpret_cast<std::uintptr_t>(this); }
+        };
+        std::uintptr_t addr = 1;
+
+        // 缺省对齐下限(指针): 16 字节对齐的可调用体不得就地存放
+        sbo_function<64> heap{wide{{}, &addr}};
+        heap();
+        CHECK(addr % alignof(wide) == 0);
+        auto lo = reinterpret_cast<std::uintptr_t>(&heap);
+        CHECK((addr < lo || addr >= lo + sizeof(heap)));
+
+        // 宿主把缓冲摆在 16 字节对齐处(对象起始 = 16n + 8): 就地存放
+        struct alignas(16) host {
+            void* pad = nullptr;
+            sbo_function<64, void(), 16> fn;
+        };
+        static_assert((offsetof(host, fn) + sbo_function<64, void(), 16>::storage_offset) % 16 ==
+                      0);
+        host h;
+        h.fn.emplace_with([&] { return wide{{}, &addr}; });
+        h.fn();
+        CHECK(addr % alignof(wide) == 0);
+        lo = reinterpret_cast<std::uintptr_t>(&h.fn);
+        CHECK((addr >= lo && addr < lo + sizeof(h.fn)));
     }
 
     struct stub_node {

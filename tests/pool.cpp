@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -914,6 +915,7 @@ TEST_SUITE("huxint.nexus") {
         for (std::size_t producer = 0; producer < 4; ++producer) {
             producers.emplace_back([&, producer] {
                 // 固定分片数允许线程号碰撞; 强制四个存活线程使用同一合法槽位.
+                detail::g_cell_seq.fetch_add(1, std::memory_order_seq_cst);
                 detail::tls_external_cell = 0;
                 for (std::size_t i = 0; i < each; ++i) {
                     const std::size_t index = producer * each + i;
@@ -1249,5 +1251,171 @@ TEST_SUITE("huxint.nexus") {
         REQUIRE(!r);
         CHECK(r.error() == submit_error::stopped);
         CHECK(!inline_ran);
+    }
+
+    // 全池等待的两条性质(worker 记账为单写者存储, 唤醒由取活落空的 worker 通告)
+
+    // wait() 返回即整棵派生树完成: 子任务的登记不带闸门复查, 靠"父任务未完成
+    // 则池不空"的不变式传递. 任何一轮提前返回都会在计数上露出来
+    TEST_CASE("wait_covers_every_nested_descendant") {
+        for (const std::size_t threads : {1uz, 2uz, 4uz, 8uz}) {
+            for (const auto budget : {0us, 64us}) {
+                pool p({.threads = threads, .spin_budget = budget});
+                constexpr int depth = 9; // 每轮 2^9 个叶子
+                std::atomic<int> leaves{0};
+                auto go = [&](auto&& self, int d) noexcept -> void {
+                    if (d == 0) {
+                        leaves.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                    p.fork_join([&, d]() noexcept { self(self, d - 1); },
+                                [&, d]() noexcept { self(self, d - 1); });
+                };
+                int expect = 0;
+                for (int round = 0; round < 200; ++round) {
+                    REQUIRE(p.execute([&]() noexcept { go(go, depth); }));
+                    p.wait();
+                    expect += 1 << depth;
+                    REQUIRE(leaves.load(std::memory_order_relaxed) == expect);
+                }
+            }
+        }
+    }
+
+    // 多个 worker 几乎同时收工时, wait() 也须紧跟最后一次完成返回, 而不是等到
+    // 某个 worker 耗尽自旋预算入睡前才被通告. 预算取 2s 把两种行为拉开量级
+    TEST_CASE("wait_wakes_promptly_when_workers_finish_together") {
+        tu::deadlock_watchdog dog(60s, "wait_wakes_promptly_when_workers_finish_together");
+        constexpr std::size_t workers = 4;
+        pool p({.threads = workers, .spin_budget = 2s});
+        for (int round = 0; round < 10; ++round) {
+            std::atomic<std::size_t> done{0};
+            for (std::size_t i = 0; i < workers; ++i) {
+                REQUIRE(p.execute([&done]() noexcept {
+                    std::this_thread::sleep_for(2ms);
+                    done.fetch_add(1, std::memory_order_release);
+                }));
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            p.wait();
+            const auto waited = std::chrono::steady_clock::now() - t0;
+            CHECK(done.load(std::memory_order_acquire) == workers);
+            CHECK(waited < 1s);
+        }
+    }
+
+    // 多个线程同时等全池空闲: 一次通告唤醒全部等待者
+    TEST_CASE("concurrent_waiters_all_return") {
+        tu::deadlock_watchdog dog(60s, "concurrent_waiters_all_return");
+        pool p({.threads = 3});
+        for (int round = 0; round < 50; ++round) {
+            std::atomic<int> ran{0};
+            tu::gate g;
+            g.block_all(p, 3);
+            for (int i = 0; i < 64; ++i) {
+                REQUIRE(
+                    p.execute([&ran]() noexcept { ran.fetch_add(1, std::memory_order_relaxed); }));
+            }
+            std::atomic<int> returned{0};
+            {
+                std::vector<std::jthread> waiters;
+                for (int i = 0; i < 4; ++i) {
+                    waiters.emplace_back([&] {
+                        p.wait();
+                        // 返回时排队任务必已全部执行
+                        if (ran.load(std::memory_order_relaxed) == 64) {
+                            returned.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    });
+                }
+                std::this_thread::sleep_for(200us); // 让等待者挂上去
+                g.release();
+            }
+            REQUIRE(returned.load() == 4);
+        }
+    }
+
+    // 关闭排空期间在途任务才收工: 排空方挂在空闲代际上, 由收工的 worker 通告
+    TEST_CASE("shutdown_discard_waits_for_running_task_then_returns") {
+        tu::deadlock_watchdog dog(60s, "shutdown_discard_waits_for_running_task_then_returns");
+        for (int round = 0; round < 20; ++round) {
+            pool p({.threads = 2, .spin_budget = 0us});
+            std::atomic<bool> started{false};
+            std::atomic<bool> finished{false};
+            REQUIRE(p.execute([&]() noexcept {
+                started.store(true, std::memory_order_release);
+                std::this_thread::sleep_for(3ms);
+                finished.store(true, std::memory_order_release);
+            }));
+            while (!started.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            p.shutdown(shutdown_policy::discard);
+            CHECK(finished.load(std::memory_order_acquire));
+        }
+    }
+
+    // 闭包缓冲的对齐: max_align_t 以内就地存放, 更强对齐落堆, 两者都按要求对齐
+    TEST_CASE("closure_capture_alignment_is_honoured") {
+        pool p({.threads = 2});
+        struct alignas(16) vec16 {
+            double v[2];
+        };
+        struct alignas(64) line64 {
+            double v[8];
+        };
+        const vec16 a{{1.0, 2.0}};
+        const line64 b{{3.0}};
+        auto ta = p.submit([a] { return reinterpret_cast<std::uintptr_t>(&a) % alignof(vec16); });
+        auto tb = p.submit([b] { return reinterpret_cast<std::uintptr_t>(&b) % alignof(line64); });
+        CHECK(ta.get().value_or(1) == 0);
+        CHECK(tb.get().value_or(1) == 0);
+    }
+
+    // 持续输入不能阻止另一个输入线程领取其任务结果.
+    TEST_CASE("continuous_input_does_not_starve_independent_results") {
+        tu::deadlock_watchdog watchdog(30s, "continuous_input_does_not_starve_independent_results");
+        std::atomic<std::size_t> completed{0};
+        std::atomic<bool> filled{false};
+        pool p({.threads = 1});
+        tu::gate gate;
+        gate.block_all(p, 1);
+        std::jthread stream([&](std::stop_token stop) {
+            detail::g_cell_seq.fetch_add(2, std::memory_order_seq_cst);
+            detail::tls_external_cell = 0;
+            constexpr std::size_t window = 1024;
+            std::size_t issued = 0;
+            while (!stop.stop_requested()) {
+                if (issued - completed.load(std::memory_order_acquire) >= window) {
+                    std::this_thread::yield();
+                    continue;
+                }
+                if (!p.execute([&completed]() noexcept {
+                        std::this_thread::sleep_for(20us);
+                        completed.fetch_add(1, std::memory_order_release);
+                    })) {
+                    std::abort();
+                }
+                if (++issued == window) {
+                    filled.store(true, std::memory_order_release);
+                }
+            }
+        });
+        while (!filled.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        task<int> checkpoint;
+        {
+            std::jthread submitter([&] {
+                detail::g_cell_seq.fetch_add(2, std::memory_order_seq_cst);
+                detail::tls_external_cell = 1;
+                checkpoint = p.submit([] { return 42; });
+            });
+        }
+        gate.release();
+        REQUIRE(checkpoint.get().value_or(0) == 42);
+        stream.request_stop();
+        stream.join();
+        p.shutdown(shutdown_policy::discard);
     }
 }

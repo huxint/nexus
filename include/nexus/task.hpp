@@ -114,19 +114,32 @@ namespace huxint::nexus {
 
         /// 任务节点: 窃取队列与全局队列上流转的实体. 稳态由每 worker 空闲链表回收;
         /// 队列槽中仅存指针(平凡可拷贝), 保证 Chase-Lev 读-CAS 语义安全
-        struct task_node {
-            /// 任务闭包. 实参 run: true = 执行; false = 从未执行即被丢弃(关闭
-            /// discard / 提交被拒), 持有结果通道的闭包据此以取消语义终结之 -
-            /// 若随节点直接湮灭, 用户侧 get() 将在 done 等待上永久阻塞.
-            /// 丢弃收尾由闭包自身承载, 节点不另存钩子, 执行后也无陈旧状态可残留.
-            /// 104 使节点恰好 128B 填满 malloc 的 128B 桶: 零内存代价下的最大 SBO 容量
-            sbo_function<104, void(bool)> body;
+        ///
+        /// 布局: 热字段连续排在节点头部 - 链接字(偏移 0), 闭包的分发表指针(8),
+        /// 闭包本体(16 起). 节点在提交线程与执行线程之间来回流转, 构造、执行、
+        /// 回收碰的都是这一段; 小闭包的任务因此多数只碰一条缓存行.
+        /// 节点保持 128B, 按 max_align_t 对齐
+        struct alignas(std::max_align_t) task_node {
+            /// 闭包缓冲容量: 128B 减去链接字与分发表指针
+            static constexpr std::size_t sbo_bytes = 128 - 2 * sizeof(void*);
+            using body_t = sbo_function<sbo_bytes, void(bool), alignof(std::max_align_t)>;
+
             /// 侵入式链接: 归属全局队列溢出链或 worker 空闲链时的后继. 节点
             /// 同一时刻只在一处, 两种归属共用一个字段
             task_node* next = nullptr;
+            /// 任务闭包. 实参 run: true = 执行; false = 从未执行即被丢弃(关闭
+            /// discard / 提交被拒), 持有结果通道的闭包据此以取消语义终结之 -
+            /// 若随节点直接湮灭, 用户侧 get() 将在 done 等待上永久阻塞.
+            /// 丢弃收尾由闭包自身承载, 节点不另存钩子, 执行后也无陈旧状态可残留
+            body_t body;
         };
         static_assert(sizeof(task_node) == 128,
-                      "task_node must exactly fill the 128B malloc bucket");
+                      "task_node must remain 128 bytes");
+        /// 闭包缓冲落在 max_align_t 对齐的地址上: 兑现 body_t 的 InplaceAlign
+        static_assert((offsetof(task_node, body) + task_node::body_t::storage_offset) %
+                              alignof(std::max_align_t) ==
+                          0,
+                      "task_node must place the closure buffer at a max-aligned offset");
 
         /// 续延节点: 任务完成时被内联执行一次的类型擦除回调
         /// 不用虚函数是为了让节点保持平凡布局, 并省去 vptr 与虚析构的间接开销

@@ -268,7 +268,12 @@ namespace {
         o.hooks = std::move(hooks);
         Pool p(std::move(o));
 
-        std::atomic<std::size_t> n{0};
+        // 独占一条缓存行: worker 更新计数时不使主线程栈上的闭包常量失效.
+        // worker 之间对同一计数器的真实争用仍计入吞吐
+        struct alignas(64) {
+            std::atomic<std::size_t> value{0};
+        } completion;
+        auto& n = completion.value;
         constexpr std::size_t warmup = 32768;
         for (std::size_t i = 0; i < warmup; ++i) {
             require_success(

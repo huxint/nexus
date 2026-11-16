@@ -8,14 +8,28 @@
 
 namespace huxint::nexus::detail {
 
-    template <std::size_t SboBytes, typename Sig = void()>
+    template <std::size_t SboBytes, typename Sig = void(),
+              std::size_t InplaceAlign = alignof(void*)>
     class sbo_function;
 
-    /// 小缓冲优化的类型擦除函数, 就地驻留于宿主(任务节点)且不可移动.
-    /// 可调用体不超过 SboBytes 时零堆分配. 构造时的堆分配仅发生在提交边界,
-    /// 由调用方 catch
-    template <std::size_t SboBytes, typename R, typename... Args>
-    class sbo_function<SboBytes, R(Args...)> {
+    /**
+     * @brief 小缓冲优化的类型擦除函数, 就地驻留于宿主(任务节点)且不可移动
+     *
+     * 可调用体不超过 SboBytes 时零堆分配. 构造时的堆分配仅发生在提交边界,
+     * 由调用方 catch
+     *
+     * 布局: 分发表指针在前, 缓冲紧随其后(偏移 storage_offset). 执行一个任务
+     * 要读的三样东西 - 分发表指针, 闭包头部, 宿主的链接字 - 由此落在宿主对象
+     * 的同一段起始内存里; 反过来把指针放在缓冲之后, 它就被整段缓冲推到另一条
+     * 缓存行上
+     *
+     * @tparam InplaceAlign 缓冲起始地址的对齐下限, 决定哪些可调用体能就地存放
+     *         (对齐要求更高的落堆). 缺省取指针对齐 - 类型自身即可保证.
+     *         宿主把本对象摆在更强对齐的地址上时可上调, 由宿主负责兑现
+     *         (task_node 以 static_assert 核对偏移)
+     */
+    template <std::size_t SboBytes, typename R, typename... Args, std::size_t InplaceAlign>
+    class sbo_function<SboBytes, R(Args...), InplaceAlign> {
         struct vtable {
             R (*invoke)(std::byte* self, Args... args);
             /// 调用后即析构: 执行一次即弃的宿主(任务节点)只付一次间接调用
@@ -32,8 +46,7 @@ namespace huxint::nexus::detail {
 
         /// 就地存储的准入: 尺寸与对齐都落在缓冲内
         template <typename FD>
-        static constexpr bool inplace =
-            sizeof(FD) <= SboBytes && alignof(FD) <= alignof(std::max_align_t);
+        static constexpr bool inplace = sizeof(FD) <= SboBytes && alignof(FD) <= InplaceAlign;
 
         template <typename FD>
         static const vtable* inplace_vt() noexcept {
@@ -69,6 +82,9 @@ namespace huxint::nexus::detail {
 
     public:
         using result_type = R;
+
+        /// 缓冲相对本对象起始的偏移(宿主据此核对 InplaceAlign 的兑现)
+        static constexpr std::size_t storage_offset = sizeof(void*);
 
         sbo_function() noexcept = default;
 
@@ -128,9 +144,8 @@ namespace huxint::nexus::detail {
         }
 
     private:
-        alignas(std::max_align_t)
-            std::byte storage_[SboBytes > sizeof(void*) ? SboBytes : sizeof(void*)]{};
         const vtable* vt_ = nullptr;
+        alignas(void*) std::byte storage_[SboBytes > sizeof(void*) ? SboBytes : sizeof(void*)]{};
     };
 
 } // namespace huxint::nexus::detail
